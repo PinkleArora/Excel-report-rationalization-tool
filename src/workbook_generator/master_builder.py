@@ -47,7 +47,12 @@ from src.reconciliation.reconciler import (
     reconcile,
     reconciliation_summary,
 )
-from src.schema_matching.matcher import ColumnMatch, match_all_bundles
+from src.schema_matching.matcher import (
+    ColumnMatch,
+    MatchConfidence,
+    detect_many_to_one_mappings,
+    match_all_bundles,
+)
 from src.workbook_generator.generator import SheetSpec, generate_workbook
 
 logger = logging.getLogger(__name__)
@@ -85,6 +90,7 @@ class MasterWorkbookContext:
     column_matches: list[ColumnMatch] = field(default_factory=list)
     workbook_analyses: list = field(default_factory=list)
     collision_log: list = field(default_factory=list)
+    many_to_one_log: list = field(default_factory=list)
     master_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     source_mapping_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     data_dict_entries: list[DataDictionaryEntry] = field(default_factory=list)
@@ -248,13 +254,25 @@ def _stage_profile(ctx: MasterWorkbookContext) -> None:
 def _stage_schema_matching(ctx: MasterWorkbookContext, threshold: float) -> None:
     logger.info("Stage 2/7: Schema matching (threshold=%.0f)…", threshold)
     ctx.column_matches = match_all_bundles(ctx.bundles, threshold=threshold)
-    logger.info("  → %d column match(es) found", len(ctx.column_matches))
+    ctx.many_to_one_log = detect_many_to_one_mappings(ctx.column_matches)
+    safe_n = sum(1 for m in ctx.column_matches if m.safe_to_merge)
+    review_n = sum(1 for m in ctx.column_matches if not m.safe_to_merge)
+    logger.info(
+        "  → %d match(es) total: %d safe-to-merge, %d review-only, %d many-to-one flags",
+        len(ctx.column_matches), safe_n, review_n, len(ctx.many_to_one_log),
+    )
 
 
 def _stage_schema_matching_bundles(ctx: MasterWorkbookContext, bundles: list, threshold: float) -> None:
     logger.info("Stage 2/7: Schema matching (threshold=%.0f)…", threshold)
     ctx.column_matches = match_all_bundles(bundles, threshold=threshold)
-    logger.info("  → %d column match(es) found", len(ctx.column_matches))
+    ctx.many_to_one_log = detect_many_to_one_mappings(ctx.column_matches)
+    safe_n = sum(1 for m in ctx.column_matches if m.safe_to_merge)
+    review_n = sum(1 for m in ctx.column_matches if not m.safe_to_merge)
+    logger.info(
+        "  → %d match(es) total: %d safe-to-merge, %d review-only, %d many-to-one flags",
+        len(ctx.column_matches), safe_n, review_n, len(ctx.many_to_one_log),
+    )
 
 
 def _stage_consolidate(ctx: MasterWorkbookContext) -> None:
@@ -503,25 +521,48 @@ def _build_issues_log(ctx: MasterWorkbookContext) -> pd.DataFrame:
             })
             issue_id += 1
 
-    # Collision warnings from canonical map
-    for i, collision in enumerate(ctx.collision_log, start=issue_id):
+    # Intra-frame collision warnings (two columns in same sheet → same canonical)
+    for collision in ctx.collision_log:
         rows.append({
-            "issue_id": f"COL-{i:03d}",
+            "issue_id": f"ISS-{issue_id:04d}",
             "date_raised": str(date.today()),
             "source_workbook": collision.get("workbook", ""),
             "source_sheet": collision.get("sheet", ""),
             "column": ", ".join(collision.get("colliding_columns", [])),
             "issue_description": (
-                f"Column match '{collision['source_col']}' → '{collision['target_col']}' skipped: "
-                f"would create duplicate canonical name '{collision['canonical_attempted']}' "
-                f"in sheet '{collision.get('sheet', '')}'."
+                f"Schema collision suppressed: matching "
+                f"'{collision['source_col']}' → '{collision['target_col']}' "
+                f"would create duplicate canonical name "
+                f"'{collision['canonical_attempted']}' within the same sheet. "
+                f"These columns may represent different measures."
             ),
             "severity": "MEDIUM",
-            "status": "warning",
+            "status": "OPEN",
             "owner": "",
             "target_resolution_date": "",
             "notes": "",
         })
+        issue_id += 1
+
+    # Many-to-one mapping warnings (N distinct source columns → same canonical)
+    for m2o in ctx.many_to_one_log:
+        rows.append({
+            "issue_id": f"ISS-{issue_id:04d}",
+            "date_raised": str(date.today()),
+            "source_workbook": "SCHEMA_MATCHING",
+            "source_sheet": "03_Source_Mapping",
+            "column": m2o.get("target_canonical", ""),
+            "issue_description": m2o.get("description", ""),
+            "severity": "HIGH",
+            "status": "OPEN",
+            "owner": "",
+            "target_resolution_date": "",
+            "notes": (
+                "Review 03_Source_Mapping and confirm which source columns are "
+                "truly equivalent before enabling auto-merge."
+            ),
+        })
+        issue_id += 1
 
     if not rows:
         # Placeholder row so the sheet isn't completely blank

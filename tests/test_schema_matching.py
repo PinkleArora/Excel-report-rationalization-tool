@@ -10,7 +10,9 @@ import pytest
 from src.ingestion.loader import WorkbookBundle
 from src.schema_matching.matcher import (
     ColumnMatch,
+    MatchConfidence,
     build_match_matrix,
+    detect_many_to_one_mappings,
     match_all_bundles,
     match_columns,
     match_workbooks,
@@ -243,3 +245,171 @@ class TestBuildMatchMatrix:
         matrix = build_match_matrix([bundle_a])
         assert matrix.shape == (1, 1)
         assert matrix.iloc[0, 0] == 0
+
+
+# ---------------------------------------------------------------------------
+# MatchConfidence classification
+# ---------------------------------------------------------------------------
+
+class TestMatchConfidence:
+    def test_exact_match_is_safe_to_merge(self, bundle_a, bundle_b):
+        matches = match_all_bundles([bundle_a, bundle_b], threshold=80.0)
+        exact = [m for m in matches if m.match_type == "exact"]
+        assert all(m.safe_to_merge for m in exact)
+        assert all(m.confidence == MatchConfidence.EXACT for m in exact)
+
+    def test_fuzzy_match_not_safe_to_merge_by_default(self):
+        """Fuzzy matches must NOT be marked safe_to_merge unless merge_high_confidence=True."""
+        from unittest.mock import MagicMock
+        import pandas as pd
+        src = MagicMock()
+        src.file_name = "a.xlsx"
+        src.sheets = {"S1": pd.DataFrame({"policy_no": [1]})}
+        tgt = MagicMock()
+        tgt.file_name = "b.xlsx"
+        tgt.sheets = {"S1": pd.DataFrame({"policy_number": [1]})}
+        matches = match_workbooks(src, tgt, threshold=70.0, merge_high_confidence=False)
+        fuzzy = [m for m in matches if m.match_type == "fuzzy"]
+        assert all(not m.safe_to_merge for m in fuzzy)
+
+    def test_high_confidence_fuzzy_safe_when_opted_in(self):
+        """Score ≥ 95 + merge_high_confidence=True → safe_to_merge=True."""
+        from unittest.mock import MagicMock
+        import pandas as pd
+        # Use columns with near-identical names to force a high fuzzy score
+        src = MagicMock()
+        src.file_name = "a.xlsx"
+        src.sheets = {"S": pd.DataFrame({"revenue_total": [1]})}
+        tgt = MagicMock()
+        tgt.file_name = "b.xlsx"
+        tgt.sheets = {"S": pd.DataFrame({"revenue_totals": [1]})}
+        matches = match_workbooks(src, tgt, threshold=80.0, merge_high_confidence=True)
+        if matches:
+            high = [m for m in matches if m.score >= 95.0]
+            assert all(m.safe_to_merge for m in high)
+
+    def test_review_confidence_level(self):
+        """Score 80–94 → MatchConfidence.REVIEW."""
+        from unittest.mock import MagicMock
+        import pandas as pd
+        src = MagicMock()
+        src.file_name = "a.xlsx"
+        src.sheets = {"S": pd.DataFrame({"gaap_reserve": [1]})}
+        tgt = MagicMock()
+        tgt.file_name = "b.xlsx"
+        tgt.sheets = {"S": pd.DataFrame({"non_tai_gaap_reserve": [1]})}
+        matches = match_workbooks(src, tgt, threshold=70.0)
+        review = [m for m in matches if m.confidence == MatchConfidence.REVIEW]
+        for m in review:
+            assert 70.0 <= m.score < 95.0
+            assert not m.safe_to_merge
+
+
+# ---------------------------------------------------------------------------
+# Many-to-one detection
+# ---------------------------------------------------------------------------
+
+class TestDetectManyToOne:
+    def _make_safe_match(self, src_col, tgt_col, score=100.0, match_type="exact"):
+        m = ColumnMatch(
+            source_workbook="wb_a.xlsx", source_sheet="S1", source_col=src_col,
+            target_workbook="wb_b.xlsx", target_sheet="S1", target_col=tgt_col,
+            score=score, match_type=match_type,
+        )
+        if match_type == "exact":
+            object.__setattr__(m, "safe_to_merge", True)
+            object.__setattr__(m, "confidence", MatchConfidence.EXACT)
+        return m
+
+    def test_no_many_to_one_when_distinct_targets(self):
+        """Different target columns → no many-to-one issue."""
+        matches = [
+            self._make_safe_match("Revenue", "Revenue"),
+            self._make_safe_match("Cost", "Cost"),
+        ]
+        issues = detect_many_to_one_mappings(matches)
+        assert issues == []
+
+    def test_same_col_name_different_workbooks_not_flagged(self):
+        """Same column name from two workbooks mapping to same canonical is fine."""
+        m1 = self._make_safe_match("Revenue", "Revenue")
+        m2 = ColumnMatch(
+            source_workbook="wb_c.xlsx", source_sheet="S1", source_col="Revenue",
+            target_workbook="wb_b.xlsx", target_sheet="S1", target_col="Revenue",
+            score=100.0, match_type="exact",
+        )
+        object.__setattr__(m2, "safe_to_merge", True)
+        object.__setattr__(m2, "confidence", MatchConfidence.EXACT)
+        issues = detect_many_to_one_mappings([m1, m2])
+        # "revenue" from two sources — same normalized name, not many-to-one
+        assert issues == []
+
+    def test_many_to_one_detected_and_suppressed(self):
+        """Two different source cols mapping to same canonical → issue + safe_to_merge=False."""
+        m1 = self._make_safe_match("GAAP Reserve", "GAAP Reserve Total")   # gaap_reserve → gaap_reserve_total
+        m2 = self._make_safe_match("Non-TAI Reserve", "GAAP Reserve Total") # non_tai_reserve → gaap_reserve_total
+        issues = detect_many_to_one_mappings([m1, m2])
+        assert len(issues) >= 1
+        # Both matches should be downgraded
+        assert not m1.safe_to_merge
+        assert not m2.safe_to_merge
+
+    def test_many_to_one_issue_has_required_fields(self):
+        m1 = self._make_safe_match("GAAP Reserve", "GAAP Reserve Total")
+        m2 = self._make_safe_match("Tax Reserve",  "GAAP Reserve Total")
+        issues = detect_many_to_one_mappings([m1, m2])
+        assert len(issues) >= 1
+        issue = issues[0]
+        assert "target_canonical" in issue
+        assert "description" in issue
+        assert "source_columns" in issue
+
+
+# ---------------------------------------------------------------------------
+# KPI rationalization gating
+# ---------------------------------------------------------------------------
+
+class TestKpiRationalizationGating:
+    def _make_analysis(self, wb_name, label, agg_func, ref_cols):
+        from src.ingestion.workbook_analyzer import KPIDefinition, WorkbookAnalysis
+        kpi = KPIDefinition(wb_name, "Summary", "B2", label,
+                            f"={agg_func}(Data!A1:A10)", agg_func,
+                            ["Data"], ref_cols)
+        return WorkbookAnalysis(wb_name, [], [kpi])
+
+    def test_same_label_same_func_shared_col_is_candidate(self):
+        from src.ingestion.workbook_analyzer import build_kpi_inventory_df
+        a = self._make_analysis("wb_a.xlsx", "Total Revenue", "SUM", ["revenue"])
+        b = self._make_analysis("wb_b.xlsx", "Total Revenue", "SUM", ["revenue"])
+        df = build_kpi_inventory_df([a, b])
+        assert df[df["workbook_name"] == "wb_a.xlsx"]["rationalization_candidate"].iloc[0]
+
+    def test_same_label_different_func_not_candidate(self):
+        from src.ingestion.workbook_analyzer import build_kpi_inventory_df
+        a = self._make_analysis("wb_a.xlsx", "Revenue KPI", "SUM",   ["revenue"])
+        b = self._make_analysis("wb_b.xlsx", "Revenue KPI", "COUNT", ["revenue"])
+        df = build_kpi_inventory_df([a, b])
+        assert not df[df["workbook_name"] == "wb_a.xlsx"]["rationalization_candidate"].iloc[0]
+
+    def test_same_label_same_func_no_shared_cols_not_candidate(self):
+        from src.ingestion.workbook_analyzer import build_kpi_inventory_df
+        # "Total Reserve" in both workbooks but they reference completely different fields
+        a = self._make_analysis("wb_a.xlsx", "Total Reserve", "SUM", ["gaap_reserve"])
+        b = self._make_analysis("wb_b.xlsx", "Total Reserve", "SUM", ["captive_reserve"])
+        df = build_kpi_inventory_df([a, b])
+        assert not df[df["workbook_name"] == "wb_a.xlsx"]["rationalization_candidate"].iloc[0]
+
+    def test_unique_kpi_not_candidate(self):
+        from src.ingestion.workbook_analyzer import build_kpi_inventory_df
+        a = self._make_analysis("wb_a.xlsx", "LOB-Specific KPI", "SUM", ["net_premium"])
+        df = build_kpi_inventory_df([a])
+        assert not df["rationalization_candidate"].iloc[0]
+        assert not df["is_common"].iloc[0]
+
+    def test_rationalization_note_populated(self):
+        from src.ingestion.workbook_analyzer import build_kpi_inventory_df
+        a = self._make_analysis("wb_a.xlsx", "Total Revenue", "SUM", ["revenue"])
+        b = self._make_analysis("wb_b.xlsx", "Total Revenue", "SUM", ["revenue"])
+        df = build_kpi_inventory_df([a, b])
+        assert df["rationalization_note"].notna().all()
+        assert (df["rationalization_note"].str.len() > 0).all()

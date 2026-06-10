@@ -24,21 +24,26 @@ def consolidate(
 ) -> pd.DataFrame:
     """Merge workbook data guided by *matches*.
 
+    Only matches with ``safe_to_merge=True`` drive column unification.
+    Fuzzy REVIEW-level matches are ignored during consolidation — they are
+    preserved in the Source Mapping sheet for human review.
+
     Every row in the output carries two lineage columns:
-    ``_source_workbook`` and ``_source_sheet``.  Source column names are
-    normalised to their canonical forms; columns unique to a single source
-    pass through unchanged.
+    ``_source_workbook`` and ``_source_sheet``.
 
     Args:
         bundles: List of :class:`~src.ingestion.loader.WorkbookBundle` objects.
-        matches: Column matches from :func:`~src.schema_matching.matcher.match_all_bundles`.
+        matches: All matches from :func:`~src.schema_matching.matcher.match_all_bundles`.
+            Only ``safe_to_merge=True`` matches are applied.
         strategy: ``"union"`` — keep all columns (default);
-            ``"intersection"`` — keep only columns that appear in at least one match.
+            ``"intersection"`` — keep only columns confirmed by a safe match.
+        collision_log: Optional mutable list; collision/skip entries are appended.
 
     Returns:
         Consolidated :class:`pandas.DataFrame` with lineage columns first.
     """
-    canonical_map = _build_canonical_map(bundles, matches, collision_log=collision_log)
+    safe_matches = [m for m in matches if m.safe_to_merge]
+    canonical_map = _build_canonical_map(bundles, safe_matches, collision_log=collision_log)
     all_frames: list[pd.DataFrame] = []
 
     for bundle in bundles:
@@ -124,20 +129,31 @@ def build_source_mapping_df(
     matches: list[ColumnMatch],
     collision_log: list | None = None,
 ) -> pd.DataFrame:
-    """Build a tidy Source Mapping table.
+    """Build a tidy Source Mapping table showing all matches.
 
-    Each row represents one source column and its canonical master column.
+    ALL match confidence levels are included so the human reviewer can see
+    both confirmed merges and suggestions requiring review.
 
-    Returns:
-        DataFrame with columns: source_workbook, source_sheet, source_column,
-        canonical_column, match_type, match_score, is_matched.
+    Columns:
+        source_workbook, source_sheet, source_column,
+        canonical_column (applied in master data),
+        match_type, match_score, match_confidence,
+        safe_to_merge (True = applied automatically),
+        review_required (True = human confirmation needed),
+        matched_to_workbook, matched_to_sheet, matched_to_column,
+        is_matched.
     """
-    canonical_map = _build_canonical_map(bundles, matches, collision_log=collision_log)
+    safe_matches = [m for m in matches if m.safe_to_merge]
+    canonical_map = _build_canonical_map(bundles, safe_matches, collision_log=collision_log)
 
-    # Index matches by (source_workbook, source_sheet, source_col) for lookup
+    # Index ALL matches (including review-only) for documentation
     match_index: dict[tuple, ColumnMatch] = {}
     for m in matches:
-        match_index[(m.source_workbook, m.source_sheet, m.source_col)] = m
+        key = (m.source_workbook, m.source_sheet, m.source_col)
+        # Prefer higher-confidence match if multiple exist for same source col
+        existing = match_index.get(key)
+        if existing is None or m.score > existing.score:
+            match_index[key] = m
 
     rows: list[dict] = []
     for bundle in bundles:
@@ -147,6 +163,7 @@ def build_source_mapping_df(
                 key = (bundle.file_name, sheet_name, col_str)
                 canonical = canonical_map.get(key, normalize_column_name(col_str))
                 match = match_index.get(key)
+                confidence_str = match.confidence.value if match else "none"
                 rows.append({
                     "source_workbook": bundle.file_name,
                     "source_sheet": sheet_name,
@@ -154,6 +171,11 @@ def build_source_mapping_df(
                     "canonical_column": canonical,
                     "match_type": match.match_type if match else "none",
                     "match_score": round(match.score, 1) if match else None,
+                    "match_confidence": confidence_str,
+                    "safe_to_merge": match.safe_to_merge if match else False,
+                    "review_required": (
+                        match is not None and not match.safe_to_merge
+                    ),
                     "matched_to_workbook": match.target_workbook if match else "",
                     "matched_to_sheet": match.target_sheet if match else "",
                     "matched_to_column": match.target_col if match else "",

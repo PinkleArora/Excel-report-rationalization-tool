@@ -298,7 +298,19 @@ def analyze_many(
 def build_kpi_inventory_df(analyses: list[WorkbookAnalysis]) -> pd.DataFrame:
     """Flatten all KPI definitions into a tidy DataFrame.
 
-    Adds an ``is_common`` flag: True when the same label appears in ≥2 workbooks.
+    Adds three rationalization columns:
+
+    ``is_common``
+        True when the same KPI label appears in ≥ 2 workbooks (name similarity
+        only — may still represent different metrics).
+
+    ``rationalization_candidate``
+        True when a KPI pair shares the same label **and** the same aggregate
+        function **and** at least one overlapping referenced source column.
+        Only these pairs are truly candidates for consolidation.
+
+    ``rationalization_note``
+        Human-readable explanation of why the KPI is or is not a candidate.
     """
     rows = []
     for analysis in analyses:
@@ -312,18 +324,73 @@ def build_kpi_inventory_df(analyses: list[WorkbookAnalysis]) -> pd.DataFrame:
                 "referenced_sheets": ", ".join(kpi.referenced_sheets),
                 "referenced_columns": ", ".join(kpi.referenced_columns),
                 "cell_address": kpi.cell_address,
+                "_ref_cols_set": set(kpi.referenced_columns),
             })
 
     if not rows:
         return pd.DataFrame(columns=[
             "workbook_name", "source_tab", "kpi_label", "formula",
             "aggregate_function", "referenced_sheets", "referenced_columns",
-            "cell_address", "is_common",
+            "cell_address", "is_common", "rationalization_candidate",
+            "rationalization_note",
         ])
 
     df = pd.DataFrame(rows)
     label_counts = df.groupby("kpi_label")["workbook_name"].nunique()
     df["is_common"] = df["kpi_label"].map(lambda lbl: label_counts.get(lbl, 0) >= 2)
+
+    candidates: list[bool] = []
+    notes: list[str] = []
+
+    for _, row in df.iterrows():
+        if not row["is_common"]:
+            candidates.append(False)
+            notes.append("Unique to one workbook — no rationalization needed.")
+            continue
+
+        # Find peer KPIs with same label from other workbooks
+        peers = df[
+            (df["kpi_label"] == row["kpi_label"]) &
+            (df["workbook_name"] != row["workbook_name"])
+        ]
+        same_func = peers[peers["aggregate_function"] == row["aggregate_function"]]
+        if same_func.empty:
+            candidates.append(False)
+            notes.append(
+                f"Same label in multiple workbooks but different aggregate functions "
+                f"({row['aggregate_function']} vs "
+                f"{', '.join(peers['aggregate_function'].unique())}). "
+                f"Review before consolidating."
+            )
+            continue
+
+        # Check for overlapping referenced columns
+        overlapping = same_func[
+            same_func["_ref_cols_set"].apply(
+                lambda peer_cols: bool(peer_cols & row["_ref_cols_set"])
+                if isinstance(peer_cols, set) and isinstance(row["_ref_cols_set"], set)
+                else False
+            )
+        ]
+        if not overlapping.empty:
+            candidates.append(True)
+            shared = row["_ref_cols_set"] & overlapping.iloc[0]["_ref_cols_set"]
+            notes.append(
+                f"Rationalization candidate: same label, same function "
+                f"({row['aggregate_function']}), shared source columns: "
+                f"{', '.join(sorted(shared))}."
+            )
+        else:
+            candidates.append(False)
+            notes.append(
+                f"Same label and function ({row['aggregate_function']}) but no "
+                f"overlapping referenced source columns. These KPIs likely measure "
+                f"different data — keep separate."
+            )
+
+    df["rationalization_candidate"] = candidates
+    df["rationalization_note"] = notes
+    df.drop(columns=["_ref_cols_set"], inplace=True)
     return df
 
 
