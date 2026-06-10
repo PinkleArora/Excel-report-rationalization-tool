@@ -36,6 +36,9 @@ def main() -> None:
 
     if page == "Home":
         _render_home()
+    elif page in ("Upload & Ingest", "Profile Reports"):
+        from src.ui.pages.profile_reports import render as render_profile
+        render_profile()
     else:
         st.info(f"**{page}** — coming soon. Business logic will be implemented in a subsequent sprint.")
 
