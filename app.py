@@ -39,6 +39,9 @@ def main() -> None:
     elif page in ("Upload & Ingest", "Profile Reports"):
         from src.ui.pages.profile_reports import render as render_profile
         render_profile()
+    elif page == "Workbook Generator":
+        from src.ui.pages.generate_master import render as render_master
+        render_master()
     else:
         st.info(f"**{page}** — coming soon. Business logic will be implemented in a subsequent sprint.")
 
