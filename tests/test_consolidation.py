@@ -186,3 +186,104 @@ class TestBuildCanonicalMap:
         src = canon.get(("sales.xlsx", "Sales", "Cost"))
         tgt = canon.get(("hr.xlsx", "HR", "Cost"))
         assert src == tgt == "cost"
+
+
+class TestCollisionSafePropagation:
+    """Tests for intra-frame collision detection in _build_canonical_map."""
+
+    def test_no_collision_match_applied(self):
+        """When no collision, match propagates normally."""
+        from src.consolidation.consolidator import _build_canonical_map
+        from src.schema_matching.matcher import ColumnMatch
+        import pandas as pd
+
+        bundle = MagicMock()
+        bundle.file_name = "wb.xlsx"
+        bundle.sheets = {"Sheet1": pd.DataFrame({"revenue": [1], "cost": [2]})}
+
+        bundle2 = MagicMock()
+        bundle2.file_name = "wb2.xlsx"
+        bundle2.sheets = {"Sheet1": pd.DataFrame({"Revenue": [10]})}
+
+        match = ColumnMatch(
+            source_workbook="wb.xlsx", source_sheet="Sheet1", source_col="revenue",
+            target_workbook="wb2.xlsx", target_sheet="Sheet1", target_col="Revenue",
+            score=100.0, match_type="exact",
+        )
+        result = _build_canonical_map([bundle, bundle2], [match])
+        # Both should map to "revenue" (shorter/earlier)
+        assert result[("wb.xlsx", "Sheet1", "revenue")] == "revenue"
+        assert result[("wb2.xlsx", "Sheet1", "Revenue")] == "revenue"
+
+    def test_intra_frame_collision_skipped(self):
+        """Match that would create duplicate canonical in same sheet is skipped."""
+        from src.consolidation.consolidator import _build_canonical_map
+        from src.schema_matching.matcher import ColumnMatch
+        import pandas as pd
+
+        # wb.xlsx has BOTH "revenue_total" and "rev_total" in the same sheet
+        bundle = MagicMock()
+        bundle.file_name = "wb.xlsx"
+        bundle.sheets = {"S": pd.DataFrame({"revenue_total": [1], "rev_total": [2]})}
+
+        bundle2 = MagicMock()
+        bundle2.file_name = "wb2.xlsx"
+        bundle2.sheets = {"S": pd.DataFrame({"rev_total": [10]})}
+
+        # This match would try to unify "revenue_total" and "rev_total" → both → "rev_total"
+        # but wb.xlsx/S already has both → collision
+        match = ColumnMatch(
+            source_workbook="wb.xlsx", source_sheet="S", source_col="revenue_total",
+            target_workbook="wb2.xlsx", target_sheet="S", target_col="rev_total",
+            score=82.0, match_type="fuzzy",
+        )
+        collision_log = []
+        result = _build_canonical_map([bundle, bundle2], [match], collision_log=collision_log)
+        # wb.xlsx/S columns should NOT be unified (would cause collision)
+        assert result[("wb.xlsx", "S", "revenue_total")] != result[("wb.xlsx", "S", "rev_total")]
+        assert len(collision_log) == 1
+
+    def test_collision_log_populated(self):
+        """collision_log gets an entry for each skipped match."""
+        from src.consolidation.consolidator import _build_canonical_map
+        from src.schema_matching.matcher import ColumnMatch
+        import pandas as pd
+
+        bundle = MagicMock()
+        bundle.file_name = "wb.xlsx"
+        bundle.sheets = {"S": pd.DataFrame({"revenue_total": [1], "rev_total": [2]})}
+        bundle2 = MagicMock()
+        bundle2.file_name = "wb2.xlsx"
+        bundle2.sheets = {"S": pd.DataFrame({"rev_total": [10]})}
+        match = ColumnMatch("wb.xlsx", "S", "revenue_total", "wb2.xlsx", "S", "rev_total", 82.0, "fuzzy")
+
+        log = []
+        _build_canonical_map([bundle, bundle2], [match], collision_log=log)
+        assert log[0]["source_col"] == "revenue_total"
+        assert log[0]["target_col"] == "rev_total"
+
+    def test_disambiguate_columns_renames_dupes(self):
+        """_disambiguate_columns adds _dup2, _dup3 suffixes for repeated col names."""
+        from src.consolidation.consolidator import _disambiguate_columns
+        import pandas as pd
+        df = pd.DataFrame([[1, 2, 3]], columns=["a", "a", "a"])
+        out = _disambiguate_columns(df)
+        assert list(out.columns) == ["a", "a_dup2", "a_dup3"]
+
+    def test_consolidate_no_crash_on_collision_scenario(self):
+        """consolidate() should not raise InvalidIndexError even with fuzzy collision risk."""
+        from src.consolidation.consolidator import consolidate
+        from src.schema_matching.matcher import ColumnMatch
+        import pandas as pd
+
+        bundle = MagicMock()
+        bundle.file_name = "wb.xlsx"
+        bundle.sheets = {"S": pd.DataFrame({"revenue_total": [1, 2], "rev_total": [3, 4]})}
+        bundle2 = MagicMock()
+        bundle2.file_name = "wb2.xlsx"
+        bundle2.sheets = {"S": pd.DataFrame({"rev_total": [10, 20]})}
+        match = ColumnMatch("wb.xlsx", "S", "revenue_total", "wb2.xlsx", "S", "rev_total", 82.0, "fuzzy")
+
+        # Should not raise
+        result = consolidate([bundle, bundle2], [match])
+        assert not result.empty
