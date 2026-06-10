@@ -20,6 +20,7 @@ def consolidate(
     bundles: list,
     matches: list[ColumnMatch],
     strategy: str = "union",
+    collision_log: list | None = None,
 ) -> pd.DataFrame:
     """Merge workbook data guided by *matches*.
 
@@ -37,7 +38,7 @@ def consolidate(
     Returns:
         Consolidated :class:`pandas.DataFrame` with lineage columns first.
     """
-    canonical_map = _build_canonical_map(bundles, matches)
+    canonical_map = _build_canonical_map(bundles, matches, collision_log=collision_log)
     all_frames: list[pd.DataFrame] = []
 
     for bundle in bundles:
@@ -52,6 +53,7 @@ def consolidate(
                 for col in frame.columns
             }
             frame.rename(columns=rename, inplace=True)
+            frame = _disambiguate_columns(frame)
             # Prepend lineage columns
             frame.insert(0, LINEAGE_COL_SHEET, sheet_name)
             frame.insert(0, LINEAGE_COL_WORKBOOK, bundle.file_name)
@@ -120,6 +122,7 @@ def resolve_conflicts(master: pd.DataFrame, strategy: str = "last_wins") -> pd.D
 def build_source_mapping_df(
     bundles: list,
     matches: list[ColumnMatch],
+    collision_log: list | None = None,
 ) -> pd.DataFrame:
     """Build a tidy Source Mapping table.
 
@@ -129,7 +132,7 @@ def build_source_mapping_df(
         DataFrame with columns: source_workbook, source_sheet, source_column,
         canonical_column, match_type, match_score, is_matched.
     """
-    canonical_map = _build_canonical_map(bundles, matches)
+    canonical_map = _build_canonical_map(bundles, matches, collision_log=collision_log)
 
     # Index matches by (source_workbook, source_sheet, source_col) for lookup
     match_index: dict[tuple, ColumnMatch] = {}
@@ -164,16 +167,47 @@ def build_source_mapping_df(
 # Private helpers
 # ---------------------------------------------------------------------------
 
+def _detect_intra_frame_collisions(
+    canon_map: dict[tuple[str, str, str], str],
+) -> list[tuple[str, str, list[str]]]:
+    """Return list of (workbook, sheet, [colliding_originals]) where ≥2 cols share a canonical."""
+    from collections import defaultdict
+    by_frame: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    for (wb, sh, col), can in canon_map.items():
+        by_frame[(wb, sh)][can].append(col)
+    collisions = []
+    for (wb, sh), can_to_cols in by_frame.items():
+        for can, cols in can_to_cols.items():
+            if len(cols) > 1:
+                collisions.append((wb, sh, cols))
+    return collisions
+
+
+def _disambiguate_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Rename duplicate column names in-place with _dup2, _dup3 suffixes."""
+    seen: dict[str, int] = {}
+    new_cols = []
+    for col in frame.columns:
+        if col not in seen:
+            seen[col] = 1
+            new_cols.append(col)
+        else:
+            seen[col] += 1
+            new_cols.append(f"{col}_dup{seen[col]}")
+    frame.columns = new_cols
+    return frame
+
+
 def _build_canonical_map(
     bundles: list,
     matches: list[ColumnMatch],
+    collision_log: list | None = None,
 ) -> dict[tuple[str, str, str], str]:
-    """Return a mapping (workbook, sheet, original_col) → canonical_col_name.
+    """Return mapping (workbook, sheet, original_col) → canonical_col_name.
 
-    Algorithm:
-    1. Seed every column with normalize(original_col).
-    2. For each match, unify the source and target normalized names by choosing
-       the shorter (then alphabetically earlier) as the canonical form.
+    Propagation is skipped for any match that would create intra-frame collisions
+    (two distinct columns in the same sheet resolving to the same canonical name).
+    Skipped matches are appended to *collision_log* if provided.
     """
     col_to_canonical: dict[tuple[str, str, str], str] = {}
 
@@ -190,12 +224,34 @@ def _build_canonical_map(
         src_current = col_to_canonical.get(src_key, normalize_column_name(m.source_col))
         tgt_current = col_to_canonical.get(tgt_key, normalize_column_name(m.target_col))
 
-        # Choose the canonical: shorter, then alphabetically earlier
+        if src_current == tgt_current:
+            continue  # already unified
+
         canonical = min(src_current, tgt_current, key=lambda s: (len(s), s))
 
-        # Propagate canonical to all entries that currently hold either value
-        for key, val in col_to_canonical.items():
+        # Simulate the propagation
+        candidate = dict(col_to_canonical)
+        for key, val in candidate.items():
             if val in (src_current, tgt_current):
-                col_to_canonical[key] = canonical
+                candidate[key] = canonical
+
+        collisions = _detect_intra_frame_collisions(candidate)
+        if collisions:
+            for wb, sh, cols in collisions:
+                logger.warning(
+                    "Skipping match %s→%s: would create intra-frame collision in '%s/%s': %s",
+                    m.source_col, m.target_col, wb, sh, cols,
+                )
+                if collision_log is not None:
+                    collision_log.append({
+                        "source_col": m.source_col,
+                        "target_col": m.target_col,
+                        "workbook": wb,
+                        "sheet": sh,
+                        "colliding_columns": cols,
+                        "canonical_attempted": canonical,
+                    })
+        else:
+            col_to_canonical = candidate
 
     return col_to_canonical

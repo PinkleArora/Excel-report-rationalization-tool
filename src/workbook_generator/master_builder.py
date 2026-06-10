@@ -27,6 +27,7 @@ from src.documentation.generator import (
     data_dictionary_to_df,
 )
 from src.ingestion.loader import WorkbookBundle
+from src.ingestion.workbook_analyzer import WorkbookAnalysis, analyze_many, build_kpi_inventory_df, build_dependency_report_df
 from src.profiling.metadata import WorkbookMetadata
 from src.profiling.profiler import profile_many, profile_workbook
 from src.rationalization.rationalizer import (
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_OUTPUT_PATH = Path("output") / "master_workbook.xlsx"
 
 # Sheet names — prefixed for natural sort order in Excel
-SHEET_MASTER_DATA = "01_Master_Data"
+SHEET_MASTER_DATA = "01_Master_Source_Data"
 SHEET_KPI_SUMMARY = "02_KPI_Summary"
 SHEET_SOURCE_MAPPING = "03_Source_Mapping"
 SHEET_DATA_DICTIONARY = "04_Data_Dictionary"
@@ -75,6 +76,8 @@ class MasterWorkbookContext:
     bundles: list[WorkbookBundle]
     workbook_metas: list[WorkbookMetadata] = field(default_factory=list)
     column_matches: list[ColumnMatch] = field(default_factory=list)
+    workbook_analyses: list = field(default_factory=list)
+    collision_log: list = field(default_factory=list)
     master_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     source_mapping_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     data_dict_entries: list[DataDictionaryEntry] = field(default_factory=list)
@@ -126,10 +129,12 @@ def build_master_workbook(
     logger.info("=== Master Workbook Build started ===")
     logger.info("Input bundles: %s", [b.file_name for b in bundles])
 
+    _stage_analyze(ctx)
     _stage_profile(ctx)
-    _stage_schema_matching(ctx, matching_threshold)
-    _stage_consolidate(ctx)
-    _stage_source_mapping(ctx)
+    source_bundles = _source_only_bundles(ctx.bundles, ctx.workbook_analyses)
+    _stage_schema_matching_bundles(ctx, source_bundles, matching_threshold)
+    _stage_consolidate_bundles(ctx, source_bundles)
+    _stage_source_mapping_bundles(ctx, source_bundles)
     _stage_data_dictionary(ctx)
     _stage_reconciliation(ctx, reconciliation_tolerance)
     _stage_rationalization(ctx)
@@ -166,6 +171,36 @@ def build_master_workbook_bytes(
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
+def _stage_analyze(ctx: MasterWorkbookContext) -> None:
+    """Classify tabs and extract KPI formula dependencies."""
+    ctx.workbook_analyses = analyze_many(ctx.bundles)
+    logger.info("_stage_analyze: analysed %d bundle(s)", len(ctx.workbook_analyses))
+
+
+def _source_only_bundles(bundles: list, analyses: list[WorkbookAnalysis]) -> list:
+    """Return bundles containing only source-data tabs."""
+    from src.ingestion.workbook_analyzer import TabType
+    import copy
+    analysis_by_name = {a.workbook_name: a for a in analyses}
+    result = []
+    for bundle in bundles:
+        analysis = analysis_by_name.get(bundle.file_name)
+        if analysis is None:
+            result.append(bundle)
+            continue
+        source_sheets = {t.tab_name for t in analysis.tab_analyses if t.tab_type == TabType.SOURCE_DATA}
+        if not source_sheets:
+            # fallback: use all sheets
+            result.append(bundle)
+            continue
+        filtered_sheets = {k: v for k, v in bundle.sheets.items() if k in source_sheets}
+        if filtered_sheets:
+            new_bundle = copy.copy(bundle)
+            new_bundle.sheets = filtered_sheets
+            result.append(new_bundle)
+    return result
+
+
 def _stage_profile(ctx: MasterWorkbookContext) -> None:
     logger.info("Stage 1/7: Profiling %d bundle(s)…", len(ctx.bundles))
     ctx.workbook_metas = profile_many(ctx.bundles)
@@ -178,9 +213,24 @@ def _stage_schema_matching(ctx: MasterWorkbookContext, threshold: float) -> None
     logger.info("  → %d column match(es) found", len(ctx.column_matches))
 
 
+def _stage_schema_matching_bundles(ctx: MasterWorkbookContext, bundles: list, threshold: float) -> None:
+    logger.info("Stage 2/7: Schema matching (threshold=%.0f)…", threshold)
+    ctx.column_matches = match_all_bundles(bundles, threshold=threshold)
+    logger.info("  → %d column match(es) found", len(ctx.column_matches))
+
+
 def _stage_consolidate(ctx: MasterWorkbookContext) -> None:
     logger.info("Stage 3/7: Consolidating into master DataFrame…")
-    ctx.master_df = consolidate(ctx.bundles, ctx.column_matches, strategy="union")
+    ctx.master_df = consolidate(ctx.bundles, ctx.column_matches, strategy="union", collision_log=ctx.collision_log)
+    logger.info(
+        "  → Master data: %d rows × %d cols",
+        len(ctx.master_df), len(ctx.master_df.columns),
+    )
+
+
+def _stage_consolidate_bundles(ctx: MasterWorkbookContext, bundles: list) -> None:
+    logger.info("Stage 3/7: Consolidating into master DataFrame…")
+    ctx.master_df = consolidate(bundles, ctx.column_matches, strategy="union", collision_log=ctx.collision_log)
     logger.info(
         "  → Master data: %d rows × %d cols",
         len(ctx.master_df), len(ctx.master_df.columns),
@@ -189,7 +239,13 @@ def _stage_consolidate(ctx: MasterWorkbookContext) -> None:
 
 def _stage_source_mapping(ctx: MasterWorkbookContext) -> None:
     logger.info("Stage 4/7: Building source mapping…")
-    ctx.source_mapping_df = build_source_mapping_df(ctx.bundles, ctx.column_matches)
+    ctx.source_mapping_df = build_source_mapping_df(ctx.bundles, ctx.column_matches, collision_log=ctx.collision_log)
+    logger.info("  → %d source column mapping(s)", len(ctx.source_mapping_df))
+
+
+def _stage_source_mapping_bundles(ctx: MasterWorkbookContext, bundles: list) -> None:
+    logger.info("Stage 4/7: Building source mapping…")
+    ctx.source_mapping_df = build_source_mapping_df(bundles, ctx.column_matches, collision_log=ctx.collision_log)
     logger.info("  → %d source column mapping(s)", len(ctx.source_mapping_df))
 
 
@@ -299,7 +355,23 @@ def _build_kpi_summary(ctx: MasterWorkbookContext) -> pd.DataFrame:
         for wb_name, group in df.groupby(LINEAGE_COL_WORKBOOK):
             _add_stats(str(wb_name), group)
 
-    return pd.DataFrame(rows)[["source_workbook", "column", "metric", "value"]]
+    result_df = pd.DataFrame(rows)[["source_workbook", "column", "metric", "value"]]
+
+    # Append formula-based KPI inventory if available
+    if ctx.workbook_analyses:
+        kpi_inv = build_kpi_inventory_df(ctx.workbook_analyses)
+        if not kpi_inv.empty:
+            formula_rows = []
+            for _, row in kpi_inv.iterrows():
+                formula_rows.append({
+                    "source_workbook": row["workbook_name"],
+                    "column": row["kpi_label"],
+                    "metric": row["aggregate_function"],
+                    "value": row["formula"],
+                })
+            result_df = pd.concat([result_df, pd.DataFrame(formula_rows)], ignore_index=True)
+
+    return result_df
 
 
 def _build_issues_log(ctx: MasterWorkbookContext) -> pd.DataFrame:
@@ -392,6 +464,26 @@ def _build_issues_log(ctx: MasterWorkbookContext) -> pd.DataFrame:
                 "notes": "",
             })
             issue_id += 1
+
+    # Collision warnings from canonical map
+    for i, collision in enumerate(ctx.collision_log, start=issue_id):
+        rows.append({
+            "issue_id": f"COL-{i:03d}",
+            "date_raised": str(date.today()),
+            "source_workbook": collision.get("workbook", ""),
+            "source_sheet": collision.get("sheet", ""),
+            "column": ", ".join(collision.get("colliding_columns", [])),
+            "issue_description": (
+                f"Column match '{collision['source_col']}' → '{collision['target_col']}' skipped: "
+                f"would create duplicate canonical name '{collision['canonical_attempted']}' "
+                f"in sheet '{collision.get('sheet', '')}'."
+            ),
+            "severity": "MEDIUM",
+            "status": "warning",
+            "owner": "",
+            "target_resolution_date": "",
+            "notes": "",
+        })
 
     if not rows:
         # Placeholder row so the sheet isn't completely blank
