@@ -27,7 +27,14 @@ from src.documentation.generator import (
     data_dictionary_to_df,
 )
 from src.ingestion.loader import WorkbookBundle
-from src.ingestion.workbook_analyzer import WorkbookAnalysis, analyze_many, build_kpi_inventory_df, build_dependency_report_df
+from src.ingestion.workbook_analyzer import (
+    ClassificationConfig,
+    TabType,
+    WorkbookAnalysis,
+    analyze_many,
+    build_dependency_report_df,
+    build_kpi_inventory_df,
+)
 from src.profiling.metadata import WorkbookMetadata
 from src.profiling.profiler import profile_many, profile_workbook
 from src.rationalization.rationalizer import (
@@ -95,6 +102,8 @@ def build_master_workbook(
     output_path: str | Path | None = None,
     matching_threshold: float = 80.0,
     reconciliation_tolerance: float = 0.01,
+    classification_config: ClassificationConfig | None = None,
+    data_bearing_types: set[TabType] | None = None,
 ) -> Path:
     """Run the full pipeline and write ``master_workbook.xlsx``.
 
@@ -129,9 +138,9 @@ def build_master_workbook(
     logger.info("=== Master Workbook Build started ===")
     logger.info("Input bundles: %s", [b.file_name for b in bundles])
 
-    _stage_analyze(ctx)
+    _stage_analyze(ctx, config=classification_config)
     _stage_profile(ctx)
-    source_bundles = _source_only_bundles(ctx.bundles, ctx.workbook_analyses)
+    source_bundles = _source_only_bundles(ctx.bundles, ctx.workbook_analyses, data_bearing_types)
     _stage_schema_matching_bundles(ctx, source_bundles, matching_threshold)
     _stage_consolidate_bundles(ctx, source_bundles)
     _stage_source_mapping_bundles(ctx, source_bundles)
@@ -171,33 +180,62 @@ def build_master_workbook_bytes(
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
-def _stage_analyze(ctx: MasterWorkbookContext) -> None:
-    """Classify tabs and extract KPI formula dependencies."""
-    ctx.workbook_analyses = analyze_many(ctx.bundles)
+def _stage_analyze(
+    ctx: MasterWorkbookContext,
+    config: ClassificationConfig | None = None,
+) -> None:
+    """Classify tabs and extract KPI formula dependencies.
+
+    Classification is purely signal-driven — no sheet names are inspected.
+    Pass a custom *config* to tune scoring thresholds without touching source.
+    """
+    ctx.workbook_analyses = analyze_many(ctx.bundles, config=config)
     logger.info("_stage_analyze: analysed %d bundle(s)", len(ctx.workbook_analyses))
 
 
-def _source_only_bundles(bundles: list, analyses: list[WorkbookAnalysis]) -> list:
-    """Return bundles containing only source-data tabs."""
-    from src.ingestion.workbook_analyzer import TabType
+def _source_only_bundles(
+    bundles: list,
+    analyses: list[WorkbookAnalysis],
+    data_bearing_types: set[TabType] | None = None,
+) -> list:
+    """Return bundles filtered to data-bearing tabs only.
+
+    Which tab types are considered "data-bearing" is controlled by
+    *data_bearing_types*.  The default includes SOURCE_DATA and REFERENCE_DATA.
+    No sheet names are inspected — classification is purely signal-driven.
+
+    If an analysis is unavailable for a bundle, or if no data-bearing tabs are
+    found, the full bundle is included as a safe fallback.
+    """
     import copy
+    if data_bearing_types is None:
+        data_bearing_types = {TabType.SOURCE_DATA, TabType.REFERENCE_DATA}
+
     analysis_by_name = {a.workbook_name: a for a in analyses}
     result = []
     for bundle in bundles:
         analysis = analysis_by_name.get(bundle.file_name)
         if analysis is None:
+            logger.debug("No analysis for '%s' — including all sheets", bundle.file_name)
             result.append(bundle)
             continue
-        source_sheets = {t.tab_name for t in analysis.tab_analyses if t.tab_type == TabType.SOURCE_DATA}
-        if not source_sheets:
-            # fallback: use all sheets
+        data_sheets = set(analysis.data_bearing_tabs(types=data_bearing_types))
+        if not data_sheets:
+            logger.debug(
+                "'%s': no data-bearing tabs detected (types=%s) — including all sheets as fallback",
+                bundle.file_name, [t.value for t in data_bearing_types],
+            )
             result.append(bundle)
             continue
-        filtered_sheets = {k: v for k, v in bundle.sheets.items() if k in source_sheets}
+        filtered_sheets = {k: v for k, v in bundle.sheets.items() if k in data_sheets}
         if filtered_sheets:
             new_bundle = copy.copy(bundle)
             new_bundle.sheets = filtered_sheets
             result.append(new_bundle)
+            logger.info(
+                "'%s': filtered to %d data-bearing sheet(s): %s",
+                bundle.file_name, len(filtered_sheets), sorted(filtered_sheets),
+            )
     return result
 
 
