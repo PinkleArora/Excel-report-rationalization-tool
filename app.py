@@ -24,6 +24,7 @@ def main() -> None:
             "Home",
             "Upload & Ingest",
             "Profile Reports",
+            "Workbook Analysis",
             "Schema Matching",
             "Rationalization",
             "Consolidation",
@@ -39,6 +40,9 @@ def main() -> None:
     elif page in ("Upload & Ingest", "Profile Reports"):
         from src.ui.pages.profile_reports import render as render_profile
         render_profile()
+    elif page == "Workbook Analysis":
+        from src.ui.pages.workbook_analysis import render as render_analysis
+        render_analysis()
     elif page == "Workbook Generator":
         from src.ui.pages.generate_master import render as render_master
         render_master()
@@ -58,13 +62,14 @@ def _render_home() -> None:
         |------|--------|-------------|
         | 1 | **Ingest** | Upload and parse one or more Excel workbooks |
         | 2 | **Profile** | Summarise columns, data types, completeness, and statistics |
-        | 3 | **Schema Matching** | Detect duplicate or semantically equivalent columns across reports |
-        | 4 | **Rationalize** | Flag redundant reports and propose a consolidated inventory |
-        | 5 | **Consolidate** | Merge aligned reports into a single master dataset |
-        | 6 | **KPI Engine** | Define and compute standardised KPIs across consolidated data |
-        | 7 | **Workbook Generator** | Produce a clean, formatted Excel output workbook |
-        | 8 | **Documentation** | Auto-generate data dictionaries and lineage metadata |
-        | 9 | **Reconcile** | Validate output totals against source reports |
+        | 3 | **Workbook Analysis** | Classify tabs, extract KPIs, detect schema collisions — download `workbook_analysis.xlsx` |
+        | 4 | **Schema Matching** | Detect duplicate or semantically equivalent columns across reports |
+        | 5 | **Rationalize** | Flag redundant reports and propose a consolidated inventory |
+        | 6 | **Consolidate** | Merge aligned reports into a single master dataset |
+        | 7 | **KPI Engine** | Define and compute standardised KPIs across consolidated data |
+        | 8 | **Workbook Generator** | Produce a clean, formatted Excel output workbook |
+        | 9 | **Documentation** | Auto-generate data dictionaries and lineage metadata |
+        | 10 | **Reconcile** | Validate output totals against source reports |
 
         ---
         ### Getting Started
