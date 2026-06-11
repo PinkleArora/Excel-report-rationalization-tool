@@ -227,10 +227,21 @@ def analyze_source_data(
                 similar_to=similar_to_list if match_class == "similar" else [],
             )
             column_profiles.append(profile)
-            for norm in similar_group:
-                for wb, tab, orig, _, _ in unclaimed[norm]:
-                    column_mapping[(wb, tab, orig)] = canonical
-                merged_in_similar.add(norm)
+            if do_merge:
+                # All columns are genuinely equivalent — map everything to one canonical.
+                for norm in similar_group:
+                    for wb, tab, orig, _, _ in unclaimed[norm]:
+                        column_mapping[(wb, tab, orig)] = canonical
+                    merged_in_similar.add(norm)
+            else:
+                # SIMILAR but NOT merged — each column keeps its own normalised name
+                # so that distinct business fields (e.g. "GAAP Reserve - ADB" and
+                # "GAAP Reserve - WPA") remain separate columns in the output.
+                # The profile documents the similarity relationship for the user.
+                for norm in similar_group:
+                    for wb, tab, orig, _, _ in unclaimed[norm]:
+                        column_mapping[(wb, tab, orig)] = norm
+                    merged_in_similar.add(norm)
         else:
             # UNIQUE — single workbook or no similar found
             group = unclaimed[norm_a]
