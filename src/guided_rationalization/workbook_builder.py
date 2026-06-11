@@ -776,6 +776,14 @@ def _build_column_remap(
 _CELL_REF_RE = re.compile(r"\$?([A-Z]+)\$?(\d*)")
 
 
+def _sheet_ref(name: str) -> str:
+    """Return a quoted sheet reference when the name contains spaces, digits at
+    start, or special characters that Excel requires quoting for."""
+    if re.search(r"[\s\-]", name) or re.match(r"^\d", name):
+        return f"'{name}'"
+    return name
+
+
 def _rewrite_formula(
     formula: str,
     old_sheet: str,
@@ -783,6 +791,8 @@ def _rewrite_formula(
     col_remap: dict[str, str],
     lob_value: str | None = None,
     lob_col_letter: str = "C",
+    old_self_sheet: str | None = None,
+    new_self_sheet: str | None = None,
 ) -> str:
     """Rewrite *formula* replacing references to *old_sheet* with *new_sheet*.
 
@@ -791,8 +801,13 @@ def _rewrite_formula(
     (SUM / COUNT / AVERAGE / MAX / MIN) are converted to SUMPRODUCT / COUNTIF
     equivalents filtered to the relevant LOB row.
 
+    *old_self_sheet* / *new_self_sheet*: when the original worksheet
+    contains formulas that reference itself (e.g. ``=Summary!$A6``), pass
+    the original tab name and the new numbered tab name so those
+    self-references are updated as well.
+
     The formula string is returned unchanged if it contains no reference to
-    *old_sheet*.
+    any of the recognised sheet names.
     """
     # Build a regex that matches the exact sheet name (with or without quotes)
     escaped = re.escape(old_sheet)
@@ -802,11 +817,8 @@ def _rewrite_formula(
         re.IGNORECASE,
     )
 
-    if not sheet_pattern.search(formula):
-        return formula
-
-    # Quoted new sheet name if it contains spaces or special chars
-    new_sheet_ref = f"'{new_sheet}'" if re.search(r"[\s\-]", new_sheet) else new_sheet
+    # Quoted new sheet name if it contains spaces, leading digits, or special chars
+    new_sheet_ref = _sheet_ref(new_sheet)
 
     def _remap_cell(ref_str: str) -> str:
         """Remap column letters in a cell or range reference string."""
@@ -821,7 +833,24 @@ def _rewrite_formula(
         ref = _remap_cell(m.group(1))
         return f"{new_sheet_ref}!{ref}"
 
+    if not sheet_pattern.search(formula) and not (
+        old_self_sheet and re.search(re.escape(old_self_sheet), formula, re.IGNORECASE)
+    ):
+        return formula
+
     rewritten = sheet_pattern.sub(replace_sheet_ref, formula)
+
+    # Self-reference rewrite: replace original KPI tab name with the new numbered name.
+    # These references do NOT get column remapping — the sheet layout is identical.
+    if old_self_sheet and new_self_sheet:
+        esc_self = re.escape(old_self_sheet)
+        self_pattern = re.compile(
+            r"(?:'?" + esc_self + r"'?)"
+            r"(!\s*\$?[A-Z]+\$?\d*(?::\$?[A-Z]+\$?\d*)?)",
+            re.IGNORECASE,
+        )
+        new_self_ref = _sheet_ref(new_self_sheet)
+        rewritten = self_pattern.sub(lambda m: f"{new_self_ref}{m.group(1)}", rewritten)
 
     # Multi-workbook LOB filter: wrap known aggregates with SUMPRODUCT / COUNTIF
     if lob_value:
@@ -862,16 +891,25 @@ def recreate_summary_sheet(
     col_remap: dict[str, str],
     lob_value: str | None = None,
     lob_col_letter: str = "C",
-) -> None:
+    old_self_tab: str | None = None,
+) -> list[dict]:
     """Copy *raw_ws* into *wb_out* as a new sheet named *tab_name*.
 
     For every formula cell that references *old_source_tab*, the formula is
     rewritten to reference *new_source_tab* with updated column positions.
+    Formulas that reference the original KPI tab itself (*old_self_tab* →
+    *tab_name*) are also rewritten so self-references remain valid.
     Non-formula cells are copied verbatim.  Merged cells, column widths,
     row heights, and cell formatting (font, fill, border, alignment,
     number_format) are preserved.
+
+    Returns a list of validation-report rows (one per formula cell) with keys:
+    ``summary_sheet``, ``cell_address``, ``original_formula``,
+    ``generated_formula``, ``sheet_exists``.
     """
     ws_new = wb_out.create_sheet(tab_name)
+    validation_rows: list[dict] = []
+    existing_sheets = set(wb_out.sheetnames)  # sheets created so far + this one
 
     # Copy column widths
     for col_letter, col_dim in raw_ws.column_dimensions.items():
@@ -893,6 +931,7 @@ def recreate_summary_sheet(
     # range); openpyxl marks them read-only and their value lives in the
     # top-left cell which we handle on the normal pass.
     from openpyxl.cell.cell import MergedCell
+    _sheet_ref_re = re.compile(r"'?([^'!]+)'?!", re.IGNORECASE)
     for row in raw_ws.iter_rows():
         for cell in row:
             if isinstance(cell, MergedCell):
@@ -902,14 +941,31 @@ def recreate_summary_sheet(
 
             # Value / formula
             if isinstance(cell.value, str) and cell.value.startswith("="):
-                new_cell.value = _rewrite_formula(
+                rewritten = _rewrite_formula(
                     cell.value,
                     old_sheet=old_source_tab,
                     new_sheet=new_source_tab,
                     col_remap=col_remap,
                     lob_value=lob_value,
                     lob_col_letter=lob_col_letter,
+                    old_self_sheet=old_self_tab,
+                    new_self_sheet=tab_name,
                 )
+                new_cell.value = rewritten
+                # Collect validation: check every sheet name referenced in the formula
+                all_sheets_ok = True
+                for ref_sheet in _sheet_ref_re.findall(rewritten):
+                    clean = ref_sheet.strip("'")
+                    if clean not in existing_sheets:
+                        all_sheets_ok = False
+                cell_addr = f"{cell.column_letter}{cell.row}"
+                validation_rows.append({
+                    "summary_sheet":      tab_name,
+                    "cell_address":       cell_addr,
+                    "original_formula":   cell.value,
+                    "generated_formula":  rewritten,
+                    "sheet_exists":       "Y" if all_sheets_ok else "N",
+                })
             else:
                 new_cell.value = cell.value
 
@@ -924,6 +980,8 @@ def recreate_summary_sheet(
                     new_cell.number_format = cell.number_format
             except Exception:
                 pass  # style copying is best-effort; never block on it
+
+    return validation_rows
 
 
 # ---------------------------------------------------------------------------
@@ -1018,6 +1076,7 @@ def build_rationalized_workbook_bytes(
     # formulas rewritten to reference Master_Source_Data.
     summary_counter = 2
     audit_tabs_data: list[tuple[object, str, object, str]] = []  # (bundle, kpi_tab, audit_df, label)
+    all_validation_rows: list[dict] = []
 
     for bundle in bundles:
         wb_cfg = config.config_for(bundle.file_name)
@@ -1048,16 +1107,18 @@ def build_rationalized_workbook_bytes(
                     source_tab=wb_cfg.source_tab,
                     column_mapping=source_result.column_mapping,
                 )
-                recreate_summary_sheet(
+                val_rows = recreate_summary_sheet(
                     wb_out=wb,
                     raw_ws=raw_ws,
                     tab_name=numbered_name,
                     old_source_tab=wb_cfg.source_tab,
-                    new_source_tab=config.future_source_tab_name,
+                    new_source_tab="01_Master_Source_Data",
                     col_remap=col_remap,
                     lob_value=lob_value,
                     lob_col_letter=lob_col_letter,
+                    old_self_tab=kpi_tab,
                 )
+                all_validation_rows.extend(val_rows)
                 logger.info(
                     "Recreated summary sheet '%s' from '%s/%s' "
                     "(col_remap: %d mappings, lob_filter: %s)",
@@ -1108,8 +1169,17 @@ def build_rationalized_workbook_bytes(
     ws_doc = wb.create_sheet(f"{base+3:02d}_Documentation")
     _write_documentation(ws_doc, config, source_result, kpi_result, master_df, profiles)
 
+    # Formula validation report — one row per formula cell in every recreated summary
+    if all_validation_rows:
+        ws_val = wb.create_sheet(f"{base+4:02d}_Formula_Validation")
+        val_df = pd.DataFrame(all_validation_rows, columns=[
+            "summary_sheet", "cell_address", "original_formula",
+            "generated_formula", "sheet_exists",
+        ])
+        _write_df_to_sheet(ws_val, val_df, title="Formula Validation Report")
+
     # Supplementary KPI Audit tabs (diagnostic, not the primary deliverable)
-    audit_base = base + 4
+    audit_base = base + (5 if all_validation_rows else 4)
     for i, (bundle, kpi_tab, audit_df, label) in enumerate(audit_tabs_data):
         audit_tab_name = f"{audit_base+i:02d}_KPI_Audit_{label}"[:31]
         ws_audit = wb.create_sheet(audit_tab_name)
