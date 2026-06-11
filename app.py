@@ -25,6 +25,7 @@ def main() -> None:
             "Upload & Ingest",
             "Profile Reports",
             "Workbook Analysis",
+            "Guided Rationalization",
             "Schema Matching",
             "Rationalization",
             "Consolidation",
@@ -43,6 +44,9 @@ def main() -> None:
     elif page == "Workbook Analysis":
         from src.ui.pages.workbook_analysis import render as render_analysis
         render_analysis()
+    elif page == "Guided Rationalization":
+        from src.ui.pages.guided_rationalization import render as render_guided
+        render_guided()
     elif page == "Workbook Generator":
         from src.ui.pages.generate_master import render as render_master
         render_master()

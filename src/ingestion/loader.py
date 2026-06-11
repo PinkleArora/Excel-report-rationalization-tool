@@ -72,6 +72,33 @@ def load_workbook(path: str | Path) -> WorkbookBundle:
         raise
 
 
+def load_workbook_from_bytes(data: bytes, file_name: str) -> WorkbookBundle:
+    """Load an Excel workbook from raw bytes (e.g. a Streamlit upload).
+
+    Args:
+        data: Raw bytes of the .xlsx / .xlsm file.
+        file_name: Original file name (used as the bundle identifier).
+
+    Returns:
+        A :class:`WorkbookBundle` with one DataFrame per sheet.
+    """
+    import io
+    import openpyxl
+
+    buf = io.BytesIO(data)
+    raw_wb = openpyxl.load_workbook(buf, data_only=False)
+    sheets: dict[str, pd.DataFrame] = {}
+    for sheet_name in raw_wb.sheetnames:
+        buf.seek(0)
+        df = pd.read_excel(buf, sheet_name=sheet_name, engine="openpyxl", header=0)
+        sheets[sheet_name] = df
+
+    # Use a synthetic Path so file_name is preserved
+    fake_path = Path(file_name)
+    logger.info("Loaded %d sheet(s) from bytes (%s)", len(sheets), file_name)
+    return WorkbookBundle(source_path=fake_path, sheets=sheets, _raw_wb=raw_wb)
+
+
 def load_many(paths: list[str | Path]) -> list[WorkbookBundle]:
     """Load multiple files, skipping those that fail with a logged warning.
 
