@@ -341,55 +341,6 @@ def _step_review_analysis() -> None:
             st.rerun()
 
 
-def _generate_diagnostic_workbook(
-    bundles, config, source_result, kpi_result
-) -> bytes:
-    """Call the builder and swallow DuplicateColumnError, returning whatever bytes were produced."""
-    import io as _io
-    from openpyxl import Workbook as _WB
-    from src.guided_rationalization.workbook_builder import (
-        _rebuild_profiles_from_findings,
-        build_duplicate_column_analysis_df,
-        build_workbook_source_analysis_df,
-        build_issues_log_df,
-        _write_df_to_sheet,
-        _apply_severity_colours,
-        _write_documentation,
-        build_reconciliation_df,
-        build_data_dictionary_df,
-    )
-    profiles = _rebuild_profiles_from_findings(bundles, config, source_result)
-    wb = _WB()
-    wb.remove(wb.active)
-
-    # Empty master
-    import pandas as _pd
-    master_df = _pd.DataFrame(columns=["Source_Workbook", "Source_Sheet", "LOB_Identifier"])
-    ws = wb.create_sheet("01_Master_Source_Data")
-    _write_df_to_sheet(ws, master_df)
-    ws.cell(row=1, column=1, value="⚠ Incomplete — duplicate columns prevented concat. See 07_Duplicate_Column_Analysis.")
-
-    ws_issues = wb.create_sheet("06_Issues_Log")
-    issues_df = build_issues_log_df(profiles)
-    _write_df_to_sheet(ws_issues, issues_df, title="Issues Log")
-    _apply_severity_colours(ws_issues, issues_df)
-
-    ws_dup = wb.create_sheet("07_Duplicate_Column_Analysis")
-    dup_df = build_duplicate_column_analysis_df(profiles)
-    _write_df_to_sheet(ws_dup, dup_df, title="Duplicate Column Analysis")
-
-    ws_src = wb.create_sheet("08_Workbook_Source_Analysis")
-    src_df = build_workbook_source_analysis_df(profiles)
-    _write_df_to_sheet(ws_src, src_df, title="Workbook Source Analysis")
-
-    ws_doc = wb.create_sheet("09_Documentation")
-    _write_documentation(ws_doc, config, source_result, kpi_result, master_df, profiles)
-
-    buf = _io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
 def _step_generate() -> None:
     st.subheader("Step 5 — Generate Future-State Workbook")
 
@@ -406,7 +357,7 @@ def _step_generate() -> None:
         return
 
     xlsx_bytes: bytes | None = None
-    has_duplicates = False
+    has_blocking = False
 
     with st.spinner("Building future-state workbook…"):
         try:
@@ -414,31 +365,33 @@ def _step_generate() -> None:
                 bundles, config, source_result, kpi_result
             )
         except DuplicateColumnError as dup_exc:
-            has_duplicates = True
-            # The builder saves diagnostic bytes to exc.diagnostic_bytes before raising.
-            xlsx_bytes = dup_exc.diagnostic_bytes or _generate_diagnostic_workbook(
-                bundles, config, source_result, kpi_result
+            has_blocking = True
+            xlsx_bytes = dup_exc.diagnostic_bytes
+            blocking = [r for r in dup_exc.resolutions if r.scenario == "C"]
+            st.error(
+                "⚠ Manual review required — duplicate columns cannot be auto-resolved "
+                f"({len(blocking)} position(s) each used by different KPI formulas)."
             )
-            st.error("⚠ Duplicate columns detected in your source data.")
             st.markdown(
-                "The master source data **could not be consolidated** because one or more "
-                "source tabs contain duplicate column names after canonical mapping.\n\n"
-                "**The diagnostic workbook below has been generated.** Open sheets "
-                "**07_Duplicate_Column_Analysis** and **08_Workbook_Source_Analysis** "
-                "to identify the affected columns and their likely causes.\n\n"
-                "**Root cause findings:**"
+                "All other duplicate columns were **automatically resolved** "
+                "(Scenarios A, B, D).  \n"
+                "The following positions could **not** be resolved automatically because "
+                "each is referenced by a different KPI formula, and the tool cannot "
+                "determine which one to retain without business input.\n"
             )
-            for finding in dup_exc.findings:
+            for r in blocking:
                 st.markdown(
-                    f"- **{finding.workbook} / {finding.source_tab}**: "
-                    f"column `{finding.column_name}` appears **{finding.duplicate_count} times** "
-                    f"at positions {finding.column_positions}.  \n"
-                    f"  Original name(s): `{'`, `'.join(set(finding.original_names))}`  \n"
-                    f"  Likely cause: _{finding.likely_cause}_"
+                    f"- **{r.workbook} / {r.source_tab}**: "
+                    f"canonical `{r.canonical_name}` — "
+                    f"position {r.original_position} (`{r.original_col_name}`) "
+                    f"used by KPIs: `{', '.join(r.kpis_using)}`"
                 )
             st.info(
-                "Download the diagnostic workbook, review the findings, then resolve the "
-                "duplicate columns in your source files before re-running."
+                "**To resolve:** rename the conflicting source columns in your workbook "
+                "to give them distinct names (e.g. 'Reserve_Amount_Gross' and "
+                "'Reserve_Amount_Net'), then re-run.  \n"
+                "Download the diagnostic workbook below for full detail in sheet "
+                "**07_Duplicate_Column_Analysis**."
             )
         except Exception as exc:
             st.error(f"Generation failed: {exc}")
@@ -448,16 +401,16 @@ def _step_generate() -> None:
     if xlsx_bytes is None:
         return
 
-    if not has_duplicates:
+    if not has_blocking:
         st.success("Workbook generated successfully.")
 
     file_name = (
-        "diagnostic_duplicate_columns.xlsx" if has_duplicates
+        "diagnostic_manual_review_required.xlsx" if has_blocking
         else "future_state_rationalized.xlsx"
     )
     label = (
         "⬇ Download Diagnostic Workbook"
-        if has_duplicates
+        if has_blocking
         else "⬇ Download Future-State Workbook"
     )
     st.download_button(
@@ -468,17 +421,17 @@ def _step_generate() -> None:
         type="primary",
     )
 
-    if not has_duplicates:
+    if not has_blocking:
         st.divider()
         st.markdown("**Workbook contents:**")
-        st.markdown(f"""
+        st.markdown("""
 - **01_Master_Source_Data** — consolidated master source data with lineage columns
 - **02_KPI_Summary_...** — one tab per configured KPI tab (formula audit + update notes)
 - **03_Source_Mapping** — source column → canonical mapping
 - **04_Data_Dictionary** — canonical column profiles
 - **05_Reconciliation** — row-count verification per source workbook
-- **06_Issues_Log** — any issues detected during processing
-- **07_Duplicate_Column_Analysis** — duplicate column detail (clean when no issues)
+- **06_Issues_Log** — auto-resolved duplicate decisions and any warnings
+- **07_Duplicate_Column_Analysis** — full duplicate analysis with KPI usage and scenario
 - **08_Workbook_Source_Analysis** — per-workbook column uniqueness summary
 - **09_Documentation** — run configuration, lineage, and BAU update instructions
 """)
