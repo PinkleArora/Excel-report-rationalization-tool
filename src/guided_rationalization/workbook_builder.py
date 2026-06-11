@@ -1153,7 +1153,7 @@ def build_rationalized_workbook_bytes(
 
     ws_map = wb.create_sheet(f"{base:02d}_Source_Mapping")
     _write_df_to_sheet(
-        ws_map, source_result.to_mapping_dataframe(),
+        ws_map, source_result.to_enriched_mapping_dataframe(kpi_result, config),
         title="Source Column → Canonical Mapping",
     )
 
@@ -1347,7 +1347,7 @@ def build_rationalized_workbook_pair(
     ap_counter = 1
 
     ws_map = wb_ap.create_sheet(f"{ap_counter:02d}_Source_Mapping")
-    _write_df_to_sheet(ws_map, source_result.to_mapping_dataframe(),
+    _write_df_to_sheet(ws_map, source_result.to_enriched_mapping_dataframe(kpi_result, config),
                        title="Source Column → Canonical Mapping")
     ap_counter += 1
 
@@ -1381,7 +1381,7 @@ def build_rationalized_workbook_pair(
         ap_counter += 1
 
     # Removed source columns report
-    removed_df = _build_removed_columns_df(bundles, config, source_result)
+    removed_df = _build_removed_columns_df(bundles, config, source_result, kpi_result)
     if not removed_df.empty:
         ws_removed = wb_ap.create_sheet(f"{ap_counter:02d}_Removed_Source_Columns")
         _write_df_to_sheet(ws_removed, removed_df, title="Removed Source Columns")
@@ -1424,20 +1424,33 @@ def _build_removed_columns_df(
     bundles: list,
     config: RationalizationConfig,
     source_result: SourceAnalysisResult,
+    kpi_result: KpiAnalysisResult,
 ) -> pd.DataFrame:
     """Return a DataFrame listing every source column excluded from Master Source Data."""
     excl_set = set(source_result.excluded_columns)
+    if not excl_set:
+        return pd.DataFrame(
+            columns=["Workbook", "Source Tab", "Column Name",
+                     "KPI Usage Count", "Removal Reason"]
+        )
+    # Count how many KPI deps reference each canonical
+    from collections import Counter
+    canonical_usage: Counter[str] = Counter()
+    for dep in kpi_result.dependencies:
+        for canonical in dep.canonical_source_columns:
+            canonical_usage[canonical] += 1
+
     rows = []
     for wb, tab, col in sorted(excl_set):
+        canonical = source_result.column_mapping.get((wb, tab, col), col)
         rows.append({
             "Workbook":        wb,
             "Source Tab":      tab,
             "Column Name":     col,
+            "KPI Usage Count": canonical_usage.get(canonical, 0),
             "Removal Reason":  "Not referenced by any KPI formula",
         })
-    return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=["Workbook", "Source Tab", "Column Name", "Removal Reason"]
-    )
+    return pd.DataFrame(rows)
 
 
 def _profiles_from_resolutions(

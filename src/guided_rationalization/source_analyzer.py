@@ -121,6 +121,75 @@ class SourceAnalysisResult:
             })
         return pd.DataFrame(rows)
 
+    def to_enriched_mapping_dataframe(
+        self,
+        kpi_result,
+        config,
+    ) -> pd.DataFrame:
+        """Source mapping enriched with KPI dependency information.
+
+        Adds columns:
+        - kpi_tabs_using_column  — semicolon-separated future output tab names
+        - kpi_labels_using_column — semicolon-separated KPI labels
+        - usage_count             — number of KPI cells referencing this canonical
+        - retention_reason        — why the column is in Master Source Data
+        """
+        # Build lookup: canonical → list of (future_tab_name, kpi_label) per dependency
+        from collections import defaultdict
+        canonical_to_deps: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for dep in kpi_result.dependencies:
+            future_name = config.kpi_tab_name_for(dep.workbook_name, dep.kpi_tab)
+            for canonical in dep.canonical_source_columns:
+                canonical_to_deps[canonical].append((future_name, dep.kpi_label))
+
+        _LINEAGE_COLS = {"Source_Workbook", "Source_Sheet", "LOB_Identifier"}
+        excl_set = set(self.excluded_columns)
+        rows = []
+        for (wb, tab, orig_col), canonical in self.column_mapping.items():
+            profile = next(
+                (p for p in self.column_profiles if p.canonical_name == canonical), None
+            )
+            is_excluded = (wb, tab, orig_col) in excl_set
+            deps = canonical_to_deps.get(canonical, [])
+
+            # Deduplicate while preserving order
+            seen_tabs: dict[str, None] = {}
+            seen_labels: dict[str, None] = {}
+            for tab_name, label in deps:
+                seen_tabs[tab_name] = None
+                seen_labels[label] = None
+            kpi_tabs_str = "; ".join(seen_tabs)
+            kpi_labels_str = "; ".join(seen_labels)
+            usage_count = len(deps)
+
+            if canonical in _LINEAGE_COLS:
+                retention_reason = "Lineage column"
+            elif deps:
+                retention_reason = "Used by KPI calculations"
+            elif is_excluded:
+                retention_reason = "Not referenced by any KPI formula"
+            else:
+                retention_reason = "Retained (unreferenced)"
+
+            rows.append({
+                "source_workbook":          wb,
+                "source_tab":               tab,
+                "source_column":            orig_col,
+                "canonical_column":         canonical,
+                "match_class":              profile.match_class if profile else "unknown",
+                "transformation":           (
+                    "renamed" if normalize_column_name(orig_col) != canonical
+                    else "no change"
+                ),
+                "in_master_source":         not is_excluded,
+                "kpi_tabs_using_column":    kpi_tabs_str,
+                "kpi_labels_using_column":  kpi_labels_str,
+                "usage_count":              usage_count,
+                "retention_reason":         retention_reason,
+            })
+        return pd.DataFrame(rows)
+
+
 
 def analyze_source_data(
     bundles: list,
