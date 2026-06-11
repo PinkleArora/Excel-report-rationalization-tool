@@ -889,9 +889,15 @@ def recreate_summary_sheet(
         except Exception:
             pass  # skip if the range can't be merged (e.g. overlap from previous iteration)
 
-    # Copy every cell
+    # Copy every cell — skip MergedCell objects (non-top-left cells of a merged
+    # range); openpyxl marks them read-only and their value lives in the
+    # top-left cell which we handle on the normal pass.
+    from openpyxl.cell.cell import MergedCell
     for row in raw_ws.iter_rows():
         for cell in row:
+            if isinstance(cell, MergedCell):
+                continue
+
             new_cell = ws_new.cell(row=cell.row, column=cell.column)
 
             # Value / formula
