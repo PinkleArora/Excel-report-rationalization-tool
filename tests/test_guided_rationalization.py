@@ -598,15 +598,18 @@ class TestBuildRationalizedWorkbookBytes:
         data = build_rationalized_workbook_bytes([bundle_a, bundle_b], config_two, sr, kr)
         assert isinstance(data, bytes) and len(data) > 0
 
-    def test_all_nine_fixed_sheets_present(self, bundle_a, bundle_b, config_two):
+    def test_all_fixed_sheets_present(self, bundle_a, bundle_b, config_two):
         sr = analyze_source_data([bundle_a, bundle_b], config_two)
         kr = analyze_kpi_dependencies([bundle_a, bundle_b], config_two, sr.column_mapping)
         data = build_rationalized_workbook_bytes([bundle_a, bundle_b], config_two, sr, kr)
         names = pd.ExcelFile(io.BytesIO(data)).sheet_names
+        # config_two has no KPI tabs, so base = 2 (01_Master_Source_Data + no summary sheets)
         for expected in (
-            "01_Master_Source_Data", "03_Source_Mapping", "04_Data_Dictionary",
-            "05_Reconciliation", "06_Issues_Log", "07_Duplicate_Column_Analysis",
-            "08_Workbook_Source_Analysis", "09_Documentation",
+            "01_Master_Source_Data",
+            "02_Source_Mapping",
+            "03_Reconciliation",
+            "04_Issues_Log",
+            "05_Documentation",
         ):
             assert expected in names, f"Missing: {expected}"
 
@@ -641,7 +644,7 @@ class TestBuildRationalizedWorkbookBytes:
             )
         assert exc_info.value.diagnostic_bytes is not None
         xl = pd.ExcelFile(io.BytesIO(exc_info.value.diagnostic_bytes))
-        assert "07_Duplicate_Column_Analysis" in xl.sheet_names
+        assert any("Duplicate_Column_Analysis" in s for s in xl.sheet_names)
 
     def test_scenario_c_error_carries_resolutions(self, bundle_dup_normcol, config_dup):
         sr = analyze_source_data([bundle_dup_normcol], config_dup)

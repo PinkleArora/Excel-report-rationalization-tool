@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from collections import Counter
+from copy import copy as _copy_obj
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -738,7 +740,188 @@ def build_master_source_df(
 
 
 # ---------------------------------------------------------------------------
-# KPI audit tab builder
+# Summary sheet recreation — column remap, formula rewriting, cell copy
+# ---------------------------------------------------------------------------
+
+def _build_column_remap(
+    source_df: pd.DataFrame,
+    master_df: pd.DataFrame,
+    workbook: str,
+    source_tab: str,
+    column_mapping: dict,
+) -> dict[str, str]:
+    """Return {old_source_col_letter → new_master_col_letter}.
+
+    The master DataFrame has three prepended lineage columns
+    (Source_Workbook, Source_Sheet, LOB_Identifier) so canonical column
+    positions are offset by 3.
+    """
+    master_cols = list(master_df.columns)
+    remap: dict[str, str] = {}
+    for pos, col in enumerate(source_df.columns):
+        col_str = str(col)
+        old_letter = _index_to_col_letter(pos)
+        canonical = column_mapping.get((workbook, source_tab, col_str))
+        if canonical is None:
+            continue
+        if canonical in master_cols:
+            new_pos = master_cols.index(canonical)
+            remap[old_letter] = _index_to_col_letter(new_pos)
+    return remap
+
+
+# Matches a single sheet-qualified cell or column reference, including optional
+# $ anchors and the second half of a range (":B10" or ":B").
+# Group 1: column letters, Group 2: optional row digits
+_CELL_REF_RE = re.compile(r"\$?([A-Z]+)\$?(\d*)")
+
+
+def _rewrite_formula(
+    formula: str,
+    old_sheet: str,
+    new_sheet: str,
+    col_remap: dict[str, str],
+    lob_value: str | None = None,
+    lob_col_letter: str = "C",
+) -> str:
+    """Rewrite *formula* replacing references to *old_sheet* with *new_sheet*.
+
+    Column letters are remapped using *col_remap*.  When *lob_value* is
+    provided (multi-workbook consolidation), range-based aggregate functions
+    (SUM / COUNT / AVERAGE / MAX / MIN) are converted to SUMPRODUCT / COUNTIF
+    equivalents filtered to the relevant LOB row.
+
+    The formula string is returned unchanged if it contains no reference to
+    *old_sheet*.
+    """
+    # Build a regex that matches the exact sheet name (with or without quotes)
+    escaped = re.escape(old_sheet)
+    sheet_pattern = re.compile(
+        r"(?:'?" + escaped + r"'?)"
+        r"!\s*(\$?[A-Z]+\$?\d*(?::\$?[A-Z]+\$?\d*)?)",
+        re.IGNORECASE,
+    )
+
+    if not sheet_pattern.search(formula):
+        return formula
+
+    # Quoted new sheet name if it contains spaces or special chars
+    new_sheet_ref = f"'{new_sheet}'" if re.search(r"[\s\-]", new_sheet) else new_sheet
+
+    def _remap_cell(ref_str: str) -> str:
+        """Remap column letters in a cell or range reference string."""
+        def replace_col(m: re.Match) -> str:
+            col = m.group(1).upper()
+            row = m.group(2)
+            new_col = col_remap.get(col, col)
+            return f"{new_col}{row}"
+        return _CELL_REF_RE.sub(replace_col, ref_str)
+
+    def replace_sheet_ref(m: re.Match) -> str:
+        ref = _remap_cell(m.group(1))
+        return f"{new_sheet_ref}!{ref}"
+
+    rewritten = sheet_pattern.sub(replace_sheet_ref, formula)
+
+    # Multi-workbook LOB filter: wrap known aggregates with SUMPRODUCT / COUNTIF
+    if lob_value:
+        agg_re = re.compile(
+            r"^=(SUM|AVERAGE|MAX|MIN|COUNTA?)\((" + re.escape(new_sheet_ref) + r"!([^)]+))\)$",
+            re.IGNORECASE,
+        )
+        m = agg_re.match(rewritten)
+        if m:
+            func = m.group(1).upper()
+            col_range = m.group(2)  # e.g. Master_Source_Data!F:F
+            lob_range = f"{new_sheet_ref}!{lob_col_letter}:{lob_col_letter}"
+            if func == "SUM":
+                rewritten = f'=SUMPRODUCT(({lob_range}="{lob_value}")*({col_range}))'
+            elif func in ("COUNT", "COUNTA"):
+                rewritten = f'=COUNTIF({lob_range},"{lob_value}")'
+            elif func == "AVERAGE":
+                rewritten = (
+                    f'=IFERROR(SUMPRODUCT(({lob_range}="{lob_value}")*({col_range}))'
+                    f'/COUNTIF({lob_range},"{lob_value}"),"")'
+                )
+            elif func in ("MAX", "MIN"):
+                # MAXIFS / MINIFS available in Excel 2019+; fall back with note
+                rewritten = (
+                    f'=IFERROR({func}IFS({col_range},{lob_range},'
+                    f'"{lob_value}"),"")'
+                )
+
+    return rewritten
+
+
+def recreate_summary_sheet(
+    wb_out: Workbook,
+    raw_ws,
+    tab_name: str,
+    old_source_tab: str,
+    new_source_tab: str,
+    col_remap: dict[str, str],
+    lob_value: str | None = None,
+    lob_col_letter: str = "C",
+) -> None:
+    """Copy *raw_ws* into *wb_out* as a new sheet named *tab_name*.
+
+    For every formula cell that references *old_source_tab*, the formula is
+    rewritten to reference *new_source_tab* with updated column positions.
+    Non-formula cells are copied verbatim.  Merged cells, column widths,
+    row heights, and cell formatting (font, fill, border, alignment,
+    number_format) are preserved.
+    """
+    ws_new = wb_out.create_sheet(tab_name)
+
+    # Copy column widths
+    for col_letter, col_dim in raw_ws.column_dimensions.items():
+        ws_new.column_dimensions[col_letter].width = col_dim.width or 10
+
+    # Copy row heights
+    for row_idx, row_dim in raw_ws.row_dimensions.items():
+        if row_dim.height:
+            ws_new.row_dimensions[row_idx].height = row_dim.height
+
+    # Copy merged cell ranges (must be done before writing cells)
+    for merged_range in list(raw_ws.merged_cells.ranges):
+        try:
+            ws_new.merge_cells(str(merged_range))
+        except Exception:
+            pass  # skip if the range can't be merged (e.g. overlap from previous iteration)
+
+    # Copy every cell
+    for row in raw_ws.iter_rows():
+        for cell in row:
+            new_cell = ws_new.cell(row=cell.row, column=cell.column)
+
+            # Value / formula
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                new_cell.value = _rewrite_formula(
+                    cell.value,
+                    old_sheet=old_source_tab,
+                    new_sheet=new_source_tab,
+                    col_remap=col_remap,
+                    lob_value=lob_value,
+                    lob_col_letter=lob_col_letter,
+                )
+            else:
+                new_cell.value = cell.value
+
+            # Formatting — copy style attributes individually to avoid
+            # shared-style mutation issues
+            try:
+                if cell.has_style:
+                    new_cell.font         = _copy_obj(cell.font)
+                    new_cell.border       = _copy_obj(cell.border)
+                    new_cell.fill         = _copy_obj(cell.fill)
+                    new_cell.alignment    = _copy_obj(cell.alignment)
+                    new_cell.number_format = cell.number_format
+            except Exception:
+                pass  # style copying is best-effort; never block on it
+
+
+# ---------------------------------------------------------------------------
+# KPI audit tab builder (supplementary diagnostic output)
 # ---------------------------------------------------------------------------
 
 def build_kpi_audit_df(
@@ -807,6 +990,13 @@ def build_rationalized_workbook_bytes(
         # Rebuild profiles using the resolutions the error carries
         profiles = _profiles_from_resolutions(bundles, config, source_result, kpi_result)
 
+    # Determine whether this is a multi-workbook consolidation (affects formula rewriting)
+    active_bundles = [b for b in bundles if config.config_for(b.file_name) is not None]
+    is_multi_workbook = len(active_bundles) > 1
+
+    # LOB column letter in Master Source Data is always C (col index 2)
+    lob_col_letter = "C"
+
     # 01 — Master Source Data
     ws_master = wb.create_sheet("01_Master_Source_Data")
     _write_df_to_sheet(ws_master, master_df, title="Master Source Data")
@@ -817,61 +1007,119 @@ def build_rationalized_workbook_bytes(
             "See 07_Duplicate_Column_Analysis.",
         )
 
-    # 02+ — KPI audit tabs
-    kpi_tab_counter = 2
+    # 02+ — Recreated Summary (reporting) tabs — the primary deliverable
+    # One tab per configured KPI tab, copied from the original worksheet with
+    # formulas rewritten to reference Master_Source_Data.
+    summary_counter = 2
+    audit_tabs_data: list[tuple[object, str, object, str]] = []  # (bundle, kpi_tab, audit_df, label)
+
     for bundle in bundles:
         wb_cfg = config.config_for(bundle.file_name)
         if wb_cfg is None:
             continue
+        raw_wb = getattr(bundle, "_raw_wb", None)
+        source_df = bundle.sheets.get(wb_cfg.source_tab)
+        lob_value = (wb_cfg.lob_identifier or bundle.file_name) if is_multi_workbook else None
+
         for kpi_tab in wb_cfg.kpi_tabs:
+            # Human-readable output tab name from user config (or auto-generated)
+            summary_tab_name = config.kpi_tab_name_for(bundle.file_name, kpi_tab)
+            numbered_name = f"{summary_counter:02d}_{summary_tab_name}"[:31]
+
+            raw_ws = None
+            if raw_wb is not None:
+                try:
+                    raw_ws = raw_wb[kpi_tab]
+                except (KeyError, TypeError):
+                    pass
+
+            if raw_ws is not None and source_df is not None:
+                # Build the column-letter remap for this workbook/source tab
+                col_remap = _build_column_remap(
+                    source_df=source_df,
+                    master_df=master_df,
+                    workbook=bundle.file_name,
+                    source_tab=wb_cfg.source_tab,
+                    column_mapping=source_result.column_mapping,
+                )
+                recreate_summary_sheet(
+                    wb_out=wb,
+                    raw_ws=raw_ws,
+                    tab_name=numbered_name,
+                    old_source_tab=wb_cfg.source_tab,
+                    new_source_tab=config.future_source_tab_name,
+                    col_remap=col_remap,
+                    lob_value=lob_value,
+                    lob_col_letter=lob_col_letter,
+                )
+                logger.info(
+                    "Recreated summary sheet '%s' from '%s/%s' "
+                    "(col_remap: %d mappings, lob_filter: %s)",
+                    numbered_name, bundle.file_name, kpi_tab,
+                    len(col_remap), lob_value or "none",
+                )
+            else:
+                # Raw worksheet not available — fall back to audit DataFrame
+                logger.warning(
+                    "Raw worksheet not available for '%s/%s' — "
+                    "falling back to KPI audit tab",
+                    bundle.file_name, kpi_tab,
+                )
+                ws_fallback = wb.create_sheet(numbered_name)
+                fallback_df = build_kpi_audit_df(
+                    bundle, kpi_tab, kpi_result, config.future_source_tab_name
+                )
+                _write_df_to_sheet(
+                    ws_fallback, fallback_df,
+                    title=f"[Fallback — no formula metadata] {kpi_tab}",
+                )
+
+            # Always collect audit data for the supplementary tab
             audit_df = build_kpi_audit_df(
                 bundle, kpi_tab, kpi_result, config.future_source_tab_name
             )
-            tab_name = (
-                f"{kpi_tab_counter:02d}_KPI_Summary_"
-                f"{config.kpi_tab_name_for(bundle.file_name, kpi_tab)}"
-            )[:31]
-            ws_kpi = wb.create_sheet(tab_name)
-            _write_df_to_sheet(ws_kpi, audit_df, title=f"KPI Audit: {kpi_tab}")
-            kpi_tab_counter += 1
+            audit_tabs_data.append((bundle, kpi_tab, audit_df, summary_tab_name))
+            summary_counter += 1
 
-    # 03 — Source Mapping
-    ws_map = wb.create_sheet("03_Source_Mapping")
+    # Fixed analytical sheets — numbered after recreated summaries
+    base = summary_counter  # first available counter after all summary tabs
+
+    ws_map = wb.create_sheet(f"{base:02d}_Source_Mapping")
     _write_df_to_sheet(
         ws_map, source_result.to_mapping_dataframe(),
         title="Source Column → Canonical Mapping",
     )
 
-    # 04 — Data Dictionary
-    ws_dd = wb.create_sheet("04_Data_Dictionary")
-    _write_df_to_sheet(ws_dd, build_data_dictionary_df(source_result, kpi_result),
-                       title="Data Dictionary")
-
-    # 05 — Reconciliation
-    ws_rec = wb.create_sheet("05_Reconciliation")
+    ws_rec = wb.create_sheet(f"{base+1:02d}_Reconciliation")
     _write_df_to_sheet(ws_rec, build_reconciliation_df(bundles, config, master_df),
                        title="Row-Count Reconciliation")
 
-    # 06 — Issues Log
-    ws_issues = wb.create_sheet("06_Issues_Log")
+    ws_issues = wb.create_sheet(f"{base+2:02d}_Issues_Log")
     issues_df = build_issues_log_df(profiles)
     _write_df_to_sheet(ws_issues, issues_df, title="Issues Log")
     _apply_severity_colours(ws_issues, issues_df)
 
-    # 07 — Duplicate Column Analysis
-    ws_dup = wb.create_sheet("07_Duplicate_Column_Analysis")
-    dup_df = build_duplicate_column_analysis_df(profiles)
-    _write_df_to_sheet(ws_dup, dup_df, title="Duplicate Column Analysis")
-    _apply_scenario_colours(ws_dup, dup_df)
-
-    # 08 — Workbook Source Analysis
-    ws_src = wb.create_sheet("08_Workbook_Source_Analysis")
-    _write_df_to_sheet(ws_src, build_workbook_source_analysis_df(profiles),
-                       title="Workbook Source Analysis")
-
-    # 09 — Documentation
-    ws_doc = wb.create_sheet("09_Documentation")
+    ws_doc = wb.create_sheet(f"{base+3:02d}_Documentation")
     _write_documentation(ws_doc, config, source_result, kpi_result, master_df, profiles)
+
+    # Supplementary KPI Audit tabs (diagnostic, not the primary deliverable)
+    audit_base = base + 4
+    for i, (bundle, kpi_tab, audit_df, label) in enumerate(audit_tabs_data):
+        audit_tab_name = f"{audit_base+i:02d}_KPI_Audit_{label}"[:31]
+        ws_audit = wb.create_sheet(audit_tab_name)
+        _write_df_to_sheet(ws_audit, audit_df, title=f"KPI Audit: {kpi_tab}")
+
+    # Optional detailed analysis sheets (appended last)
+    dup_df = build_duplicate_column_analysis_df(profiles)
+    if any(r["Recommended Action"] != "No duplicate columns detected"
+           for r in dup_df.to_dict("records")):
+        ws_dup = wb.create_sheet("Duplicate_Column_Analysis")
+        _write_df_to_sheet(ws_dup, dup_df, title="Duplicate Column Analysis")
+        _apply_scenario_colours(ws_dup, dup_df)
+
+        ws_src = wb.create_sheet("Workbook_Source_Analysis")
+        _write_df_to_sheet(ws_src, build_workbook_source_analysis_df(profiles),
+                           title="Workbook Source Analysis")
 
     buf = io.BytesIO()
     wb.save(buf)
