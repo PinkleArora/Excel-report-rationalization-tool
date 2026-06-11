@@ -7,15 +7,21 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-import openpyxl
 
 from src.ingestion.loader import WorkbookBundle, load_workbook_from_bytes
 from src.guided_rationalization.config import RationalizationConfig, WorkbookTabConfig
-from src.guided_rationalization.source_analyzer import analyze_source_data, ColumnProfile
-from src.guided_rationalization.kpi_analyzer import analyze_kpi_dependencies, KpiDependency
+from src.guided_rationalization.source_analyzer import analyze_source_data
+from src.guided_rationalization.kpi_analyzer import analyze_kpi_dependencies
 from src.guided_rationalization.workbook_builder import (
+    DuplicateColumnError,
+    DuplicateFinding,
+    SourceFrameProfile,
+    build_duplicate_column_analysis_df,
+    build_issues_log_df,
     build_master_source_df,
     build_rationalized_workbook_bytes,
+    build_workbook_source_analysis_df,
+    inspect_frames_for_duplicates,
 )
 
 
@@ -24,9 +30,7 @@ from src.guided_rationalization.workbook_builder import (
 # ---------------------------------------------------------------------------
 
 def _make_bundle(file_name: str, sheets: dict[str, pd.DataFrame]) -> WorkbookBundle:
-    """Create a minimal WorkbookBundle without needing a real file."""
-    fake_path = Path(file_name)
-    return WorkbookBundle(source_path=fake_path, sheets=sheets, _raw_wb=None)
+    return WorkbookBundle(source_path=Path(file_name), sheets=sheets, _raw_wb=None)
 
 
 @pytest.fixture
@@ -50,21 +54,33 @@ def bundle_b():
 
 
 @pytest.fixture
+def bundle_with_duplicates():
+    """Source tab has two columns that normalise to the same canonical name."""
+    df = pd.DataFrame({
+        "Policy Number": ["P001", "P002"],
+        "Policy_Number": ["P003", "P004"],   # will collide with 'Policy Number' → policy_number
+        "Revenue":       [100.0, 200.0],
+    })
+    return _make_bundle("dup_workbook.xlsx", {"Data": df})
+
+
+@pytest.fixture
 def config_two(bundle_a, bundle_b) -> RationalizationConfig:
     return RationalizationConfig(
         workbook_configs=[
-            WorkbookTabConfig(
-                workbook_name="workbook_a.xlsx",
-                source_tab="Data",
-                kpi_tabs=[],
-                lob_identifier="LOB-A",
-            ),
-            WorkbookTabConfig(
-                workbook_name="workbook_b.xlsx",
-                source_tab="Records",
-                kpi_tabs=[],
-                lob_identifier="LOB-B",
-            ),
+            WorkbookTabConfig("workbook_a.xlsx", "Data", [], "LOB-A"),
+            WorkbookTabConfig("workbook_b.xlsx", "Records", [], "LOB-B"),
+        ],
+        matching_threshold=80.0,
+        remove_unused_columns=False,
+    )
+
+
+@pytest.fixture
+def config_dup(bundle_with_duplicates) -> RationalizationConfig:
+    return RationalizationConfig(
+        workbook_configs=[
+            WorkbookTabConfig("dup_workbook.xlsx", "Data", [], "LOB-DUP"),
         ],
         matching_threshold=80.0,
         remove_unused_columns=False,
@@ -107,10 +123,6 @@ class TestRationalizationConfig:
 # ---------------------------------------------------------------------------
 
 class TestAnalyzeSourceData:
-    def test_returns_source_analysis_result(self, bundle_a, bundle_b, config_two):
-        result = analyze_source_data([bundle_a, bundle_b], config_two)
-        assert result is not None
-
     def test_common_columns_detected(self, bundle_a, bundle_b, config_two):
         result = analyze_source_data([bundle_a, bundle_b], config_two)
         common_names = {p.canonical_name for p in result.common_columns}
@@ -149,7 +161,6 @@ class TestAnalyzeSourceData:
             [bundle_a, bundle_b], config,
             kpi_referenced_canonicals={"revenue"},
         )
-        # Columns not in {"revenue"} should be excluded
         excluded_canonicals = {
             result.column_mapping.get((wb, tab, col), "")
             for wb, tab, col in result.excluded_columns
@@ -170,7 +181,7 @@ class TestAnalyzeSourceData:
 
 
 # ---------------------------------------------------------------------------
-# analyze_kpi_dependencies (without real formulas — covers no-formula path)
+# analyze_kpi_dependencies
 # ---------------------------------------------------------------------------
 
 class TestAnalyzeKpiDependencies:
@@ -187,7 +198,6 @@ class TestAnalyzeKpiDependencies:
         kpi_result = analyze_kpi_dependencies(
             [bundle_a, bundle_b], config_two, source_result.column_mapping
         )
-        # All source canonicals should be unreferenced when no KPI tabs exist
         all_canonicals = set(source_result.column_mapping.values())
         assert kpi_result.unreferenced_canonicals == all_canonicals
 
@@ -212,39 +222,174 @@ class TestAnalyzeKpiDependencies:
 
 
 # ---------------------------------------------------------------------------
-# build_master_source_df
+# inspect_frames_for_duplicates
+# ---------------------------------------------------------------------------
+
+class TestInspectFramesForDuplicates:
+    def test_clean_frames_produce_no_findings(self, bundle_a, bundle_b, config_two):
+        source_result = analyze_source_data([bundle_a, bundle_b], config_two)
+        # Build frames manually
+        frames_with_meta = []
+        for bundle in [bundle_a, bundle_b]:
+            wb_cfg = config_two.config_for(bundle.file_name)
+            df = bundle.sheets[wb_cfg.source_tab].copy()
+            frames_with_meta.append((df, bundle.file_name, wb_cfg.source_tab, {}))
+        profiles = inspect_frames_for_duplicates(frames_with_meta)
+        all_findings = [f for p in profiles for f in p.duplicate_findings]
+        assert all_findings == []
+
+    def test_duplicate_frame_detected(self):
+        df = pd.DataFrame({"A": [1], "B": [2]})
+        df.columns = pd.Index(["col_x", "col_x"])  # force duplicate
+        frames_with_meta = [(df, "wb.xlsx", "Sheet1", {"A": "col_x", "B": "col_x"})]
+        profiles = inspect_frames_for_duplicates(frames_with_meta)
+        assert profiles[0].duplicate_column_count > 0
+        assert any(f.column_name == "col_x" for f in profiles[0].duplicate_findings)
+
+    def test_profile_shape_recorded(self, bundle_a, config_two):
+        wb_cfg = config_two.config_for("workbook_a.xlsx")
+        df = bundle_a.sheets[wb_cfg.source_tab]
+        profiles = inspect_frames_for_duplicates(
+            [(df, "workbook_a.xlsx", wb_cfg.source_tab, {})]
+        )
+        assert profiles[0].shape == df.shape
+
+
+# ---------------------------------------------------------------------------
+# DuplicateColumnError
+# ---------------------------------------------------------------------------
+
+class TestDuplicateColumnError:
+    def test_str_contains_workbook_info(self):
+        finding = DuplicateFinding(
+            workbook="wb.xlsx",
+            source_tab="Data",
+            column_name="policy_number",
+            duplicate_count=2,
+            column_positions=[0, 3],
+            original_names=["Policy Number", "Policy_Number"],
+            likely_cause="normalisation_collision",
+        )
+        exc = DuplicateColumnError([finding])
+        assert "wb.xlsx" in str(exc)
+        assert "policy_number" in str(exc)
+
+    def test_diagnostic_bytes_default_none(self):
+        exc = DuplicateColumnError([])
+        assert exc.diagnostic_bytes is None
+
+    def test_diagnostic_bytes_attached(self):
+        exc = DuplicateColumnError([], diagnostic_bytes=b"xlsx")
+        assert exc.diagnostic_bytes == b"xlsx"
+
+
+# ---------------------------------------------------------------------------
+# build_duplicate_column_analysis_df / build_workbook_source_analysis_df
+# ---------------------------------------------------------------------------
+
+class TestDiagnosticDataFrames:
+    def _finding(self):
+        return DuplicateFinding(
+            workbook="wb.xlsx",
+            source_tab="Data",
+            column_name="policy_number",
+            duplicate_count=2,
+            column_positions=[0, 3],
+            original_names=["Policy Number", "Policy_Number"],
+            likely_cause="normalisation_collision — test",
+        )
+
+    def _profile_with_finding(self):
+        f = self._finding()
+        return SourceFrameProfile(
+            workbook="wb.xlsx",
+            source_tab="Data",
+            shape=(10, 5),
+            all_columns=["policy_number", "revenue", "cost", "policy_number", "region"],
+            duplicate_findings=[f],
+        )
+
+    def test_dup_analysis_df_has_finding_row(self):
+        profile = self._profile_with_finding()
+        df = build_duplicate_column_analysis_df([profile])
+        assert "policy_number" in df["Duplicate Column Name"].values
+
+    def test_dup_analysis_df_no_findings_returns_placeholder(self):
+        clean_profile = SourceFrameProfile(
+            workbook="wb.xlsx", source_tab="Data",
+            shape=(5, 3), all_columns=["a", "b", "c"],
+        )
+        df = build_duplicate_column_analysis_df([clean_profile])
+        assert "(none)" in df["Workbook"].values
+
+    def test_workbook_source_analysis_columns(self):
+        profile = self._profile_with_finding()
+        df = build_workbook_source_analysis_df([profile])
+        assert "Total Columns" in df.columns
+        assert "Duplicate Columns Count" in df.columns
+        assert df["Has Duplicates"].iloc[0] == "YES"
+
+    def test_issues_log_high_severity_for_duplicate(self):
+        profile = self._profile_with_finding()
+        df = build_issues_log_df([profile])
+        assert "HIGH" in df["Severity"].values
+
+
+# ---------------------------------------------------------------------------
+# build_master_source_df — returns (df, profiles)
 # ---------------------------------------------------------------------------
 
 class TestBuildMasterSourceDf:
     def test_combines_rows(self, bundle_a, bundle_b, config_two):
         source_result = analyze_source_data([bundle_a, bundle_b], config_two)
-        master = build_master_source_df([bundle_a, bundle_b], config_two, source_result)
-        assert len(master) == 4  # 2 rows from each workbook
+        master, profiles = build_master_source_df([bundle_a, bundle_b], config_two, source_result)
+        assert len(master) == 4
 
     def test_lineage_columns_present(self, bundle_a, bundle_b, config_two):
         source_result = analyze_source_data([bundle_a, bundle_b], config_two)
-        master = build_master_source_df([bundle_a, bundle_b], config_two, source_result)
+        master, _ = build_master_source_df([bundle_a, bundle_b], config_two, source_result)
         assert "Source_Workbook" in master.columns
         assert "Source_Sheet" in master.columns
         assert "LOB_Identifier" in master.columns
 
     def test_lob_identifier_populated(self, bundle_a, bundle_b, config_two):
         source_result = analyze_source_data([bundle_a, bundle_b], config_two)
-        master = build_master_source_df([bundle_a, bundle_b], config_two, source_result)
+        master, _ = build_master_source_df([bundle_a, bundle_b], config_two, source_result)
         assert "LOB-A" in master["LOB_Identifier"].values
         assert "LOB-B" in master["LOB_Identifier"].values
+
+    def test_profiles_returned(self, bundle_a, bundle_b, config_two):
+        source_result = analyze_source_data([bundle_a, bundle_b], config_two)
+        _, profiles = build_master_source_df([bundle_a, bundle_b], config_two, source_result)
+        assert isinstance(profiles, list)
+        assert len(profiles) == 2
 
     def test_empty_bundles_returns_df(self, config_two):
         from src.guided_rationalization.source_analyzer import SourceAnalysisResult
         empty_result = SourceAnalysisResult(
             column_profiles=[], column_mapping={}, excluded_columns=[]
         )
-        master = build_master_source_df([], config_two, empty_result)
+        master, profiles = build_master_source_df([], config_two, empty_result)
         assert isinstance(master, pd.DataFrame)
+        assert profiles == []
+
+    def test_raises_duplicate_column_error(self, bundle_with_duplicates, config_dup):
+        source_result = analyze_source_data([bundle_with_duplicates], config_dup)
+        with pytest.raises(DuplicateColumnError) as exc_info:
+            build_master_source_df([bundle_with_duplicates], config_dup, source_result)
+        assert len(exc_info.value.findings) > 0
+
+    def test_duplicate_error_identifies_correct_column(self, bundle_with_duplicates, config_dup):
+        source_result = analyze_source_data([bundle_with_duplicates], config_dup)
+        with pytest.raises(DuplicateColumnError) as exc_info:
+            build_master_source_df([bundle_with_duplicates], config_dup, source_result)
+        col_names = {f.column_name for f in exc_info.value.findings}
+        # "Policy Number" and "Policy_Number" both normalise to "policy_number"
+        assert "policy_number" in col_names
 
 
 # ---------------------------------------------------------------------------
-# build_rationalized_workbook_bytes
+# build_rationalized_workbook_bytes — clean path
 # ---------------------------------------------------------------------------
 
 class TestBuildRationalizedWorkbookBytes:
@@ -268,9 +413,10 @@ class TestBuildRationalizedWorkbookBytes:
             [bundle_a, bundle_b], config_two, source_result, kpi_result
         )
         xl = pd.ExcelFile(io.BytesIO(data))
-        assert len(xl.sheet_names) >= 1
+        # 8 fixed sheets minimum (no KPI tabs configured in config_two)
+        assert len(xl.sheet_names) >= 8
 
-    def test_master_source_sheet_present(self, bundle_a, bundle_b, config_two):
+    def test_numbered_sheet_names(self, bundle_a, bundle_b, config_two):
         source_result = analyze_source_data([bundle_a, bundle_b], config_two)
         kpi_result = analyze_kpi_dependencies(
             [bundle_a, bundle_b], config_two, source_result.column_mapping
@@ -279,9 +425,10 @@ class TestBuildRationalizedWorkbookBytes:
             [bundle_a, bundle_b], config_two, source_result, kpi_result
         )
         xl = pd.ExcelFile(io.BytesIO(data))
-        assert config_two.future_source_tab_name in xl.sheet_names
+        numbered = [s for s in xl.sheet_names if s[:2].isdigit()]
+        assert len(numbered) >= 6  # at least the fixed sheets are numbered
 
-    def test_fixed_sheets_present(self, bundle_a, bundle_b, config_two):
+    def test_all_fixed_sheets_present(self, bundle_a, bundle_b, config_two):
         source_result = analyze_source_data([bundle_a, bundle_b], config_two)
         kpi_result = analyze_kpi_dependencies(
             [bundle_a, bundle_b], config_two, source_result.column_mapping
@@ -290,8 +437,35 @@ class TestBuildRationalizedWorkbookBytes:
             [bundle_a, bundle_b], config_two, source_result, kpi_result
         )
         xl = pd.ExcelFile(io.BytesIO(data))
-        for expected in ("Column_Mapping", "KPI_Dependencies", "Column_Coverage", "Documentation"):
-            assert expected in xl.sheet_names, f"Missing sheet: {expected}"
+        names = xl.sheet_names
+        for expected in (
+            "01_Master_Source_Data",
+            "03_Source_Mapping",
+            "04_Data_Dictionary",
+            "05_Reconciliation",
+            "06_Issues_Log",
+            "07_Duplicate_Column_Analysis",
+            "08_Workbook_Source_Analysis",
+            "09_Documentation",
+        ):
+            assert expected in names, f"Missing sheet: {expected}"
+
+    def test_duplicate_raises_with_diagnostic_bytes(
+        self, bundle_with_duplicates, config_dup
+    ):
+        source_result = analyze_source_data([bundle_with_duplicates], config_dup)
+        kpi_result = analyze_kpi_dependencies(
+            [bundle_with_duplicates], config_dup, source_result.column_mapping
+        )
+        with pytest.raises(DuplicateColumnError) as exc_info:
+            build_rationalized_workbook_bytes(
+                [bundle_with_duplicates], config_dup, source_result, kpi_result
+            )
+        assert exc_info.value.diagnostic_bytes is not None
+        assert isinstance(exc_info.value.diagnostic_bytes, bytes)
+        # Diagnostic workbook must be readable
+        xl = pd.ExcelFile(io.BytesIO(exc_info.value.diagnostic_bytes))
+        assert "07_Duplicate_Column_Analysis" in xl.sheet_names
 
 
 # ---------------------------------------------------------------------------
@@ -304,8 +478,7 @@ class TestLoadWorkbookFromBytes:
         df = pd.DataFrame({"A": [1, 2], "B": [3, 4]})
         with pd.ExcelWriter(path, engine="openpyxl") as w:
             df.to_excel(w, sheet_name="Sheet1", index=False)
-        data = path.read_bytes()
-        bundle = load_workbook_from_bytes(data, "test.xlsx")
+        bundle = load_workbook_from_bytes(path.read_bytes(), "test.xlsx")
         assert bundle.file_name == "test.xlsx"
         assert "Sheet1" in bundle.sheets
 
