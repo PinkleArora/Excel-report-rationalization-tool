@@ -1223,9 +1223,222 @@ def build_rationalized_workbook(
     return output_path.resolve()
 
 
+def build_rationalized_workbook_pair(
+    bundles: list,
+    config: RationalizationConfig,
+    source_result: SourceAnalysisResult,
+    kpi_result: KpiAnalysisResult,
+) -> tuple[bytes, bytes]:
+    """Build two workbooks and return ``(future_state_bytes, analysis_pack_bytes)``.
+
+    Future_State_Workbook.xlsx
+        01_Master_Source_Data + one recreated Summary tab per KPI tab.
+        Intended for BAU use — clean and production-ready.
+
+    Rationalization_Analysis_Pack.xlsx
+        Source_Mapping, Reconciliation, Issues_Log, Documentation,
+        Formula_Validation, KPI_Audit_*, Duplicate_Column_Analysis,
+        Workbook_Source_Analysis, Removed_Source_Columns.
+        Intended for diagnostics and project documentation.
+
+    Only raises :class:`DuplicateColumnError` for unresolvable Scenario C
+    duplicates; ``exc.diagnostic_bytes`` will contain the analysis pack.
+    """
+    wb_fs = Workbook()   # future-state
+    wb_ap = Workbook()   # analysis pack
+    wb_fs.remove(wb_fs.active)
+    wb_ap.remove(wb_ap.active)
+
+    blocking_error: DuplicateColumnError | None = None
+    master_df = pd.DataFrame(columns=["Source_Workbook", "Source_Sheet", "LOB_Identifier"])
+    profiles: list[SourceFrameProfile] = []
+
+    try:
+        master_df, profiles = build_master_source_df(bundles, config, source_result, kpi_result)
+    except DuplicateColumnError as exc:
+        blocking_error = exc
+        profiles = _profiles_from_resolutions(bundles, config, source_result, kpi_result)
+
+    active_bundles = [b for b in bundles if config.config_for(b.file_name) is not None]
+    is_multi_workbook = len(active_bundles) > 1
+    lob_col_letter = "C"
+
+    # ── Future-state: 01_Master_Source_Data ──────────────────────────────────
+    ws_master = wb_fs.create_sheet("01_Master_Source_Data")
+    _write_df_to_sheet(ws_master, master_df, title="Master Source Data")
+    if blocking_error:
+        _write_warning_banner(
+            ws_master,
+            "⚠ Incomplete — Scenario C duplicates require manual review. "
+            "See Rationalization_Analysis_Pack for details.",
+        )
+
+    # ── Future-state: recreated Summary tabs + collect audit data ─────────────
+    summary_counter = 2
+    audit_tabs_data: list[tuple[object, str, object, str]] = []
+    all_validation_rows: list[dict] = []
+
+    for bundle in bundles:
+        wb_cfg = config.config_for(bundle.file_name)
+        if wb_cfg is None:
+            continue
+        raw_wb = getattr(bundle, "_raw_wb", None)
+        source_df = bundle.sheets.get(wb_cfg.source_tab)
+        lob_value = (wb_cfg.lob_identifier or bundle.file_name) if is_multi_workbook else None
+
+        for kpi_tab in wb_cfg.kpi_tabs:
+            summary_tab_name = config.kpi_tab_name_for(bundle.file_name, kpi_tab)
+            numbered_name = f"{summary_counter:02d}_{summary_tab_name}"[:31]
+
+            raw_ws = None
+            if raw_wb is not None:
+                try:
+                    raw_ws = raw_wb[kpi_tab]
+                except (KeyError, TypeError):
+                    pass
+
+            if raw_ws is not None and source_df is not None:
+                col_remap = _build_column_remap(
+                    source_df=source_df,
+                    master_df=master_df,
+                    workbook=bundle.file_name,
+                    source_tab=wb_cfg.source_tab,
+                    column_mapping=source_result.column_mapping,
+                )
+                val_rows = recreate_summary_sheet(
+                    wb_out=wb_fs,
+                    raw_ws=raw_ws,
+                    tab_name=numbered_name,
+                    old_source_tab=wb_cfg.source_tab,
+                    new_source_tab="01_Master_Source_Data",
+                    col_remap=col_remap,
+                    lob_value=lob_value,
+                    lob_col_letter=lob_col_letter,
+                    old_self_tab=kpi_tab,
+                )
+                all_validation_rows.extend(val_rows)
+                logger.info(
+                    "Recreated summary sheet '%s' from '%s/%s' "
+                    "(col_remap: %d mappings, lob_filter: %s)",
+                    numbered_name, bundle.file_name, kpi_tab,
+                    len(col_remap), lob_value or "none",
+                )
+            else:
+                logger.warning(
+                    "Raw worksheet not available for '%s/%s' — falling back to KPI audit tab",
+                    bundle.file_name, kpi_tab,
+                )
+                ws_fallback = wb_fs.create_sheet(numbered_name)
+                fallback_df = build_kpi_audit_df(
+                    bundle, kpi_tab, kpi_result, config.future_source_tab_name
+                )
+                _write_df_to_sheet(
+                    ws_fallback, fallback_df,
+                    title=f"[Fallback — no formula metadata] {kpi_tab}",
+                )
+
+            audit_df = build_kpi_audit_df(
+                bundle, kpi_tab, kpi_result, config.future_source_tab_name
+            )
+            audit_tabs_data.append((bundle, kpi_tab, audit_df, summary_tab_name))
+            summary_counter += 1
+
+    # ── Analysis pack ─────────────────────────────────────────────────────────
+    ap_counter = 1
+
+    ws_map = wb_ap.create_sheet(f"{ap_counter:02d}_Source_Mapping")
+    _write_df_to_sheet(ws_map, source_result.to_mapping_dataframe(),
+                       title="Source Column → Canonical Mapping")
+    ap_counter += 1
+
+    ws_rec = wb_ap.create_sheet(f"{ap_counter:02d}_Reconciliation")
+    _write_df_to_sheet(ws_rec, build_reconciliation_df(bundles, config, master_df),
+                       title="Row-Count Reconciliation")
+    ap_counter += 1
+
+    ws_issues = wb_ap.create_sheet(f"{ap_counter:02d}_Issues_Log")
+    issues_df = build_issues_log_df(profiles)
+    _write_df_to_sheet(ws_issues, issues_df, title="Issues Log")
+    _apply_severity_colours(ws_issues, issues_df)
+    ap_counter += 1
+
+    ws_doc = wb_ap.create_sheet(f"{ap_counter:02d}_Documentation")
+    _write_documentation(ws_doc, config, source_result, kpi_result, master_df, profiles)
+    ap_counter += 1
+
+    if all_validation_rows:
+        ws_val = wb_ap.create_sheet(f"{ap_counter:02d}_Formula_Validation")
+        val_df = pd.DataFrame(all_validation_rows, columns=[
+            "summary_sheet", "cell_address", "original_formula",
+            "generated_formula", "sheet_exists",
+        ])
+        _write_df_to_sheet(ws_val, val_df, title="Formula Validation Report")
+        ap_counter += 1
+
+    for bundle, kpi_tab, audit_df, label in audit_tabs_data:
+        ws_audit = wb_ap.create_sheet(f"{ap_counter:02d}_KPI_Audit_{label}"[:31])
+        _write_df_to_sheet(ws_audit, audit_df, title=f"KPI Audit: {kpi_tab}")
+        ap_counter += 1
+
+    # Removed source columns report
+    removed_df = _build_removed_columns_df(bundles, config, source_result)
+    if not removed_df.empty:
+        ws_removed = wb_ap.create_sheet(f"{ap_counter:02d}_Removed_Source_Columns")
+        _write_df_to_sheet(ws_removed, removed_df, title="Removed Source Columns")
+        ap_counter += 1
+
+    dup_df = build_duplicate_column_analysis_df(profiles)
+    if any(r["Recommended Action"] != "No duplicate columns detected"
+           for r in dup_df.to_dict("records")):
+        ws_dup = wb_ap.create_sheet(f"{ap_counter:02d}_Duplicate_Column_Analysis")
+        _write_df_to_sheet(ws_dup, dup_df, title="Duplicate Column Analysis")
+        _apply_scenario_colours(ws_dup, dup_df)
+        ap_counter += 1
+
+        ws_src = wb_ap.create_sheet(f"{ap_counter:02d}_Workbook_Source_Analysis")
+        _write_df_to_sheet(ws_src, build_workbook_source_analysis_df(profiles),
+                           title="Workbook Source Analysis")
+        ap_counter += 1
+
+    # Serialise both workbooks
+    buf_fs = io.BytesIO()
+    wb_fs.save(buf_fs)
+    fs_bytes = buf_fs.getvalue()
+
+    buf_ap = io.BytesIO()
+    wb_ap.save(buf_ap)
+    ap_bytes = buf_ap.getvalue()
+
+    if blocking_error:
+        blocking_error.diagnostic_bytes = ap_bytes
+        raise blocking_error
+
+    return fs_bytes, ap_bytes
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _build_removed_columns_df(
+    bundles: list,
+    config: RationalizationConfig,
+    source_result: SourceAnalysisResult,
+) -> pd.DataFrame:
+    """Return a DataFrame listing every source column excluded from Master Source Data."""
+    excl_set = set(source_result.excluded_columns)
+    rows = []
+    for wb, tab, col in sorted(excl_set):
+        rows.append({
+            "Workbook":        wb,
+            "Source Tab":      tab,
+            "Column Name":     col,
+            "Removal Reason":  "Not referenced by any KPI formula",
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["Workbook", "Source Tab", "Column Name", "Removal Reason"]
+    )
+
 
 def _profiles_from_resolutions(
     bundles: list,

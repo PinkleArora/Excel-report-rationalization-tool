@@ -19,7 +19,7 @@ from src.guided_rationalization.config import RationalizationConfig, WorkbookTab
 from src.guided_rationalization.source_analyzer import analyze_source_data
 from src.guided_rationalization.kpi_analyzer import analyze_kpi_dependencies
 from src.guided_rationalization.workbook_builder import (
-    build_rationalized_workbook_bytes,
+    build_rationalized_workbook_pair,
     DuplicateColumnError,
 )
 
@@ -225,10 +225,8 @@ def _step_naming_options() -> None:
         "Auto-merge high-confidence fuzzy matches (score ≥ 95%)",
         value=opts.get("merge_high_confidence", False),
     )
-    opts["remove_unused_columns"] = st.checkbox(
-        "Remove source columns not referenced by any KPI formula",
-        value=opts.get("remove_unused_columns", True),
-    )
+    # Always enforce KPI-only columns — removed columns are reported in the Analysis Pack.
+    opts["remove_unused_columns"] = True
 
     col1, col2 = st.columns([1, 5])
     with col1:
@@ -342,7 +340,7 @@ def _step_review_analysis() -> None:
 
 
 def _step_generate() -> None:
-    st.subheader("Step 5 — Generate Future-State Workbook")
+    st.subheader("Step 5 — Generate Workbooks")
 
     bundles = st.session_state.gr_bundles
     config = _build_config()
@@ -356,17 +354,18 @@ def _step_generate() -> None:
             st.rerun()
         return
 
-    xlsx_bytes: bytes | None = None
+    fs_bytes: bytes | None = None
+    ap_bytes: bytes | None = None
     has_blocking = False
 
-    with st.spinner("Building future-state workbook…"):
+    with st.spinner("Building workbooks…"):
         try:
-            xlsx_bytes = build_rationalized_workbook_bytes(
+            fs_bytes, ap_bytes = build_rationalized_workbook_pair(
                 bundles, config, source_result, kpi_result
             )
         except DuplicateColumnError as dup_exc:
             has_blocking = True
-            xlsx_bytes = dup_exc.diagnostic_bytes
+            ap_bytes = dup_exc.diagnostic_bytes
             blocking = [r for r in dup_exc.resolutions if r.scenario == "C"]
             st.error(
                 "⚠ Manual review required — duplicate columns cannot be auto-resolved "
@@ -390,50 +389,68 @@ def _step_generate() -> None:
                 "**To resolve:** rename the conflicting source columns in your workbook "
                 "to give them distinct names (e.g. 'Reserve_Amount_Gross' and "
                 "'Reserve_Amount_Net'), then re-run.  \n"
-                "Download the diagnostic workbook below for full detail in sheet "
-                "**07_Duplicate_Column_Analysis**."
+                "Download the Analysis Pack below for full detail."
             )
         except Exception as exc:
             st.error(f"Generation failed: {exc}")
             logger.exception("Workbook generation error")
             return
 
-    if xlsx_bytes is None:
-        return
+    if has_blocking:
+        if ap_bytes:
+            st.download_button(
+                label="⬇ Download Diagnostic Analysis Pack",
+                data=ap_bytes,
+                file_name="Rationalization_Analysis_Pack_diagnostic.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+    else:
+        st.success("Workbooks generated successfully.")
 
-    if not has_blocking:
-        st.success("Workbook generated successfully.")
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.markdown("### 📊 Future State Workbook")
+            st.caption(
+                "Production-ready workbook for BAU use.  \n"
+                "Contains: Master Source Data + recreated KPI Summary tabs."
+            )
+            st.download_button(
+                label="⬇ Download Future_State_Workbook.xlsx",
+                data=fs_bytes,
+                file_name="Future_State_Workbook.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="dl_fs",
+            )
+            st.markdown("""
+**Contents:**
+- `01_Master_Source_Data` — KPI-referenced columns only, with lineage
+- `02_...` onwards — one recreated Summary tab per configured KPI tab
+""")
 
-    file_name = (
-        "diagnostic_manual_review_required.xlsx" if has_blocking
-        else "future_state_rationalized.xlsx"
-    )
-    label = (
-        "⬇ Download Diagnostic Workbook"
-        if has_blocking
-        else "⬇ Download Future-State Workbook"
-    )
-    st.download_button(
-        label=label,
-        data=xlsx_bytes,
-        file_name=file_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
-
-    if not has_blocking:
-        st.divider()
-        st.markdown("**Workbook contents:**")
-        st.markdown("""
-- **01_Master_Source_Data** — consolidated master source data with lineage columns
-- **02_KPI_Summary_...** — one tab per configured KPI tab (formula audit + update notes)
-- **03_Source_Mapping** — source column → canonical mapping
-- **04_Data_Dictionary** — canonical column profiles
-- **05_Reconciliation** — row-count verification per source workbook
-- **06_Issues_Log** — auto-resolved duplicate decisions and any warnings
-- **07_Duplicate_Column_Analysis** — full duplicate analysis with KPI usage and scenario
-- **08_Workbook_Source_Analysis** — per-workbook column uniqueness summary
-- **09_Documentation** — run configuration, lineage, and BAU update instructions
+        with col_dl2:
+            st.markdown("### 🔍 Rationalization Analysis Pack")
+            st.caption(
+                "Diagnostic and project documentation workbook.  \n"
+                "Contains: mappings, audit, reconciliation, removed columns, documentation."
+            )
+            st.download_button(
+                label="⬇ Download Rationalization_Analysis_Pack.xlsx",
+                data=ap_bytes,
+                file_name="Rationalization_Analysis_Pack.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_ap",
+            )
+            st.markdown("""
+**Contents:**
+- `Source_Mapping` — source column → canonical mapping
+- `Reconciliation` — row-count verification
+- `Issues_Log` — auto-resolved decisions and warnings
+- `Documentation` — run configuration and BAU update instructions
+- `Formula_Validation` — generated formula audit (sheet references verified)
+- `KPI_Audit_...` — per-KPI formula details
+- `Removed_Source_Columns` — columns excluded from Master Source Data
+- `Duplicate_Column_Analysis` — KPI usage and scenario (when applicable)
 """)
 
     col1, col2 = st.columns([1, 5])
