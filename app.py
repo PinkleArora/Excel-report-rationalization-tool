@@ -35,7 +35,7 @@ def main() -> None:
     # Primary navigation
     primary_choice = st.sidebar.radio(
         "Go to",
-        ["Home", "Guided Rationalization"],
+        ["Home", "Guided Rationalization", "Agentic Rationalization"],
         key="nav_primary",
     )
 
@@ -63,7 +63,7 @@ def main() -> None:
         page = st.session_state["nav_active_archive"]
 
     # Primary links reset archive selection
-    if primary_choice in ("Home", "Guided Rationalization"):
+    if primary_choice in ("Home", "Guided Rationalization", "Agentic Rationalization"):
         if f"_prev_primary_{primary_choice}" not in st.session_state:
             st.session_state["nav_active_archive"] = None
         st.session_state[f"_prev_primary_{primary_choice}"] = True
@@ -74,6 +74,9 @@ def main() -> None:
     elif page == "Guided Rationalization":
         from src.ui.pages.guided_rationalization import render as render_guided
         render_guided()
+    elif page == "Agentic Rationalization":
+        from src.ui.pages.agentic_rationalization import render as render_agentic
+        render_agentic()
     elif page in ("Upload & Ingest", "Profile Reports"):
         from src.ui.pages.profile_reports import render as render_profile
         render_profile()
@@ -105,6 +108,10 @@ def _render_home() -> None:
         4. Generate two output workbooks:
            - **Future_State_Workbook.xlsx** — production-ready: master source data + recreated KPI tabs
            - **Rationalization_Analysis_Pack.xlsx** — diagnostics: mappings, audit, reconciliation, documentation
+
+        Use **Agentic Rationalization** for an AI-driven workflow where agents
+        analyse your workbooks, explain every decision with confidence scores,
+        and produce a full Agent Decision Log alongside the output workbooks.
 
         ---
 
