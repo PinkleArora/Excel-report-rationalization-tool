@@ -28,6 +28,10 @@ from src.guided_rationalization.lineage_builder import (
     build_kpi_dependencies_df,
     build_lineage_workbook,
 )
+from src.guided_rationalization.diagram_builder import (
+    build_rationalization_flow,
+    build_dependency_diagram,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -408,6 +412,75 @@ def _step_review_analysis() -> None:
         key="dl_lineage_preview",
     )
 
+    # ── Visual Diagrams ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🗺️ Visual Rationalization Diagrams")
+    st.caption(
+        "Business-friendly visuals embedded in the Analysis Pack.  "
+        "Download PNG or SVG for presentations and documentation."
+    )
+
+    diag_flow_png = diag_flow_svg = diag_dep_png = diag_dep_svg = None
+    try:
+        with st.spinner("Generating diagrams…"):
+            diag_flow_png, diag_flow_svg = build_rationalization_flow(
+                source_result, kpi_result, config
+            )
+            diag_dep_png, diag_dep_svg = build_dependency_diagram(
+                source_result, kpi_result, config
+            )
+    except Exception as _diag_err:
+        st.warning(f"Diagram generation encountered an issue: {_diag_err}")
+
+    if diag_flow_png:
+        diag_t1, diag_t2 = st.tabs(
+            ["🔵 Rationalization Flow", "🔗 Column Dependency"]
+        )
+        with diag_t1:
+            st.image(diag_flow_png, use_container_width=True)
+            dcol1, dcol2 = st.columns(2)
+            dcol1.download_button(
+                "⬇ Flow Diagram — PNG",
+                data=diag_flow_png,
+                file_name="Rationalization_Flow.png",
+                mime="image/png",
+                key="dl_flow_png",
+            )
+            dcol2.download_button(
+                "⬇ Flow Diagram — SVG",
+                data=diag_flow_svg,
+                file_name="Rationalization_Flow.svg",
+                mime="image/svg+xml",
+                key="dl_flow_svg",
+            )
+        with diag_t2:
+            st.image(diag_dep_png, use_container_width=True)
+            dcol3, dcol4 = st.columns(2)
+            dcol3.download_button(
+                "⬇ Dependency Diagram — PNG",
+                data=diag_dep_png,
+                file_name="Dependency_Diagram.png",
+                mime="image/png",
+                key="dl_dep_png",
+            )
+            dcol4.download_button(
+                "⬇ Dependency Diagram — SVG",
+                data=diag_dep_svg,
+                file_name="Dependency_Diagram.svg",
+                mime="image/svg+xml",
+                key="dl_dep_svg",
+            )
+        st.caption(
+            "Both diagrams are also embedded in the Rationalization Analysis Pack "
+            "(Rationalization_Flow and Dependency_Diagram sheets)."
+        )
+
+    # Store for re-use in Step 5
+    st.session_state["gr_flow_png"]  = diag_flow_png
+    st.session_state["gr_flow_svg"]  = diag_flow_svg
+    st.session_state["gr_dep_png"]   = diag_dep_png
+    st.session_state["gr_dep_svg"]   = diag_dep_svg
+
     col1, col2 = st.columns([1, 5])
     with col1:
         if st.button("← Back"):
@@ -569,6 +642,23 @@ def _step_generate() -> None:
 - `KPI_Dependencies` — compact dependency map
 - `Legend` — confidence colour key and status definitions
 """)
+
+    # ── Diagram exports ───────────────────────────────────────────────────────
+    flow_png = st.session_state.get("gr_flow_png")
+    flow_svg = st.session_state.get("gr_flow_svg")
+    dep_png  = st.session_state.get("gr_dep_png")
+    dep_svg  = st.session_state.get("gr_dep_svg")
+
+    if flow_png or dep_png:
+        with st.expander("📊 Export Visual Diagrams", expanded=False):
+            st.caption("Download PNG or SVG diagrams for presentations and documentation.")
+            exp_cols = st.columns(4)
+            if flow_png:
+                exp_cols[0].download_button("⬇ Flow PNG",  flow_png, "Rationalization_Flow.png",  "image/png", key="dl_s5_flow_png")
+                exp_cols[1].download_button("⬇ Flow SVG",  flow_svg, "Rationalization_Flow.svg",  "image/svg+xml", key="dl_s5_flow_svg")
+            if dep_png:
+                exp_cols[2].download_button("⬇ Dependency PNG", dep_png, "Dependency_Diagram.png", "image/png", key="dl_s5_dep_png")
+                exp_cols[3].download_button("⬇ Dependency SVG", dep_svg, "Dependency_Diagram.svg", "image/svg+xml", key="dl_s5_dep_svg")
 
     col1, col2 = st.columns([1, 5])
     with col1:

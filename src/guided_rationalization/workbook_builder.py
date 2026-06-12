@@ -55,6 +55,10 @@ from src.guided_rationalization.lineage_builder import (
     build_column_lineage_df,
     build_kpi_dependencies_df,
 )
+from src.guided_rationalization.diagram_builder import (
+    build_all_diagrams,
+    embed_diagrams_in_workbook,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1397,7 +1401,19 @@ def build_rationalized_workbook_pair(
     dep_df = build_kpi_dependencies_df(source_result, kpi_result, config)
     ws_dep = wb_ap.create_sheet(f"{ap_counter:02d}_KPI_Dependencies")
     _write_df_to_sheet(ws_dep, dep_df, title="KPI Dependencies — Compact Dependency Map")
-    ap_counter += 1  # noqa: F841  (counter kept consistent for future tabs)
+    ap_counter += 1
+
+    # ── Visual diagrams ───────────────────────────────────────────────────────
+    try:
+        diagrams = build_all_diagrams(source_result, kpi_result, config, master_df)
+        if diagrams["flow_png"] and diagrams["dep_png"]:
+            embed_diagrams_in_workbook(
+                wb_ap,
+                flow_png=diagrams["flow_png"],
+                dep_png=diagrams["dep_png"],
+            )
+    except Exception as _diag_exc:
+        logger.warning("Diagram generation skipped: %s", _diag_exc)
 
     # Serialise both workbooks
     buf_fs = io.BytesIO()
