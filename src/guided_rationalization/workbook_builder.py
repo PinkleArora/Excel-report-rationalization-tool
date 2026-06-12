@@ -50,6 +50,11 @@ from openpyxl.utils import get_column_letter
 from src.guided_rationalization.config import RationalizationConfig
 from src.guided_rationalization.source_analyzer import SourceAnalysisResult
 from src.guided_rationalization.kpi_analyzer import KpiAnalysisResult
+from src.guided_rationalization.lineage_builder import (
+    build_data_lineage_df,
+    build_column_lineage_df,
+    build_kpi_dependencies_df,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1377,6 +1382,22 @@ def build_rationalized_workbook_pair(
         _write_df_to_sheet(ws_src, build_workbook_source_analysis_df(profiles),
                            title="Workbook Source Analysis")
         ap_counter += 1
+
+    # ── Data Lineage sheets ───────────────────────────────────────────────────
+    lineage_df = build_data_lineage_df(source_result, kpi_result, config)
+    ws_lin = wb_ap.create_sheet(f"{ap_counter:02d}_Data_Lineage")
+    _write_df_to_sheet(ws_lin, lineage_df, title="Data Lineage — KPI to Source Column Traceability")
+    ap_counter += 1
+
+    col_lin_df = build_column_lineage_df(source_result, kpi_result, config)
+    ws_col_lin = wb_ap.create_sheet(f"{ap_counter:02d}_Column_Lineage")
+    _write_df_to_sheet(ws_col_lin, col_lin_df, title="Column Lineage — Master Column Provenance")
+    ap_counter += 1
+
+    dep_df = build_kpi_dependencies_df(source_result, kpi_result, config)
+    ws_dep = wb_ap.create_sheet(f"{ap_counter:02d}_KPI_Dependencies")
+    _write_df_to_sheet(ws_dep, dep_df, title="KPI Dependencies — Compact Dependency Map")
+    ap_counter += 1  # noqa: F841  (counter kept consistent for future tabs)
 
     # Serialise both workbooks
     buf_fs = io.BytesIO()

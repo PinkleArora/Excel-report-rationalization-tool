@@ -22,6 +22,12 @@ from src.guided_rationalization.workbook_builder import (
     build_rationalized_workbook_pair,
     DuplicateColumnError,
 )
+from src.guided_rationalization.lineage_builder import (
+    build_data_lineage_df,
+    build_column_lineage_df,
+    build_kpi_dependencies_df,
+    build_lineage_workbook,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +361,53 @@ def _step_review_analysis() -> None:
         if not cov_df.empty:
             st.dataframe(cov_df, use_container_width=True)
 
+    # ── Data Lineage preview ──────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📐 Data Lineage")
+    st.caption(
+        "Full traceability from source columns to KPI outputs.  "
+        "These reports are also included in the Rationalization Analysis Pack."
+    )
+
+    lineage_tab1, lineage_tab2, lineage_tab3 = st.tabs(
+        ["KPI → Source (Data Lineage)", "Column Provenance (Column Lineage)", "Dependency Map"]
+    )
+
+    with lineage_tab1:
+        lin_df = build_data_lineage_df(source_result, kpi_result, config)
+        if lin_df.empty:
+            st.info("No KPI dependencies found.")
+        else:
+            st.caption(f"{len(lin_df)} KPI formula(s) traced to source columns.")
+            st.dataframe(lin_df, use_container_width=True, hide_index=True)
+
+    with lineage_tab2:
+        col_lin_df = build_column_lineage_df(source_result, kpi_result, config)
+        if col_lin_df.empty:
+            st.info("No column lineage data available.")
+        else:
+            st.caption(f"{len(col_lin_df)} column source entries.")
+            st.dataframe(col_lin_df, use_container_width=True, hide_index=True)
+
+    with lineage_tab3:
+        dep_df = build_kpi_dependencies_df(source_result, kpi_result, config)
+        if dep_df.empty:
+            st.info("No KPI dependencies found.")
+        else:
+            st.caption(f"{len(dep_df)} KPI dependency rows.")
+            st.dataframe(dep_df, use_container_width=True, hide_index=True)
+
+    with st.spinner("Building lineage workbook…"):
+        lineage_bytes = build_lineage_workbook(source_result, kpi_result, config)
+
+    st.download_button(
+        label="⬇ Download Data_Lineage.xlsx (standalone)",
+        data=lineage_bytes,
+        file_name="Data_Lineage.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_lineage_preview",
+    )
+
     col1, col2 = st.columns([1, 5])
     with col1:
         if st.button("← Back"):
@@ -434,7 +487,17 @@ def _step_generate() -> None:
     else:
         st.success("Workbooks generated successfully.")
 
-        col_dl1, col_dl2 = st.columns(2)
+        # Build standalone lineage workbook
+        source_result_gen = st.session_state.get("gr_source_result")
+        kpi_result_gen = st.session_state.get("gr_kpi_result")
+        lineage_bytes_gen: bytes | None = None
+        if source_result_gen and kpi_result_gen:
+            try:
+                lineage_bytes_gen = build_lineage_workbook(source_result_gen, kpi_result_gen, config)
+            except Exception as _exc:
+                logger.warning("Could not build lineage workbook: %s", _exc)
+
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
         with col_dl1:
             st.markdown("### 📊 Future State Workbook")
             st.caption(
@@ -459,7 +522,7 @@ def _step_generate() -> None:
             st.markdown("### 🔍 Rationalization Analysis Pack")
             st.caption(
                 "Diagnostic and project documentation workbook.  \n"
-                "Contains: mappings, audit, reconciliation, removed columns, documentation."
+                "Contains: mappings, audit, reconciliation, lineage, documentation."
             )
             st.download_button(
                 label="⬇ Download Rationalization_Analysis_Pack.xlsx",
@@ -474,10 +537,37 @@ def _step_generate() -> None:
 - `Reconciliation` — row-count verification
 - `Issues_Log` — auto-resolved decisions and warnings
 - `Documentation` — run configuration and BAU update instructions
-- `Formula_Validation` — generated formula audit (sheet references verified)
+- `Formula_Validation` — generated formula audit
 - `KPI_Audit_...` — per-KPI formula details
 - `Removed_Source_Columns` — columns excluded from Master Source Data
 - `Duplicate_Column_Analysis` — KPI usage and scenario (when applicable)
+- `Data_Lineage` — KPI → source column traceability
+- `Column_Lineage` — master column provenance
+- `KPI_Dependencies` — compact dependency map
+""")
+
+        with col_dl3:
+            st.markdown("### 📐 Data Lineage")
+            st.caption(
+                "Standalone lineage workbook for sharing with business stakeholders.  \n"
+                "Contains: Data Lineage, Column Lineage, KPI Dependencies, Legend."
+            )
+            if lineage_bytes_gen:
+                st.download_button(
+                    label="⬇ Download Data_Lineage.xlsx",
+                    data=lineage_bytes_gen,
+                    file_name="Data_Lineage.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_lineage_gen",
+                )
+            else:
+                st.info("Lineage workbook unavailable.")
+            st.markdown("""
+**Contents:**
+- `Data_Lineage` — KPI formula → source columns
+- `Column_Lineage` — original column → master column
+- `KPI_Dependencies` — compact dependency map
+- `Legend` — confidence colour key and status definitions
 """)
 
     col1, col2 = st.columns([1, 5])
