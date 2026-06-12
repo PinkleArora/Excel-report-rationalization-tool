@@ -122,7 +122,6 @@ def _step_upload() -> None:
                         st.session_state.gr_wb_configs[b.file_name] = {
                             "source_tab": "",
                             "kpi_tabs": [],
-                            "lob_identifier": "",
                         }
                 st.session_state.gr_step = 1
                 st.rerun()
@@ -163,13 +162,6 @@ def _step_configure_tabs() -> None:
                 key=f"gr_kpi_{bundle.file_name}",
             )
             cfg["kpi_tabs"] = kpi_tabs
-
-            lob = st.text_input(
-                "LOB identifier (optional — labels rows in master source)",
-                value=cfg["lob_identifier"],
-                key=f"gr_lob_{bundle.file_name}",
-            )
-            cfg["lob_identifier"] = lob
 
         if not cfg["source_tab"]:
             all_valid = False
@@ -257,7 +249,6 @@ def _build_config() -> RationalizationConfig:
             workbook_name=wb_name,
             source_tab=cfg["source_tab"],
             kpi_tabs=cfg["kpi_tabs"],
-            lob_identifier=cfg["lob_identifier"],
         )
         for wb_name, cfg in wb_configs.items()
         if cfg["source_tab"]
@@ -295,15 +286,51 @@ def _step_review_analysis() -> None:
     st.session_state.gr_kpi_result = kpi_result
 
     # ── Metrics ──────────────────────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Common columns", len(source_result.common_columns))
-    c2.metric("Similar columns", len(source_result.similar_columns))
-    c3.metric("Unique columns", len(source_result.unique_columns))
-    c4.metric("Excluded (unused)", len(source_result.excluded_columns))
+    # Count source column *entries* (one per source workbook × column), not
+    # de-duplicated canonicals, so the numbers reconcile to a total.
+    excl_set = set(source_result.excluded_columns)
+    common_kpi = sum(
+        1 for (wb, tab, col), canonical in source_result.column_mapping.items()
+        if (wb, tab, col) not in excl_set
+        and canonical in kpi_result.referenced_canonicals
+        and next((p for p in source_result.column_profiles if p.canonical_name == canonical), None) is not None
+        and next((p for p in source_result.column_profiles if p.canonical_name == canonical)).match_class == "common"
+    )
+    unique_kpi = sum(
+        1 for (wb, tab, col), canonical in source_result.column_mapping.items()
+        if (wb, tab, col) not in excl_set
+        and canonical in kpi_result.referenced_canonicals
+        and (
+            next((p for p in source_result.column_profiles if p.canonical_name == canonical), None) is None
+            or next((p for p in source_result.column_profiles if p.canonical_name == canonical)).match_class != "common"
+        )
+    )
+    excluded_count = len(source_result.excluded_columns)
+    total_source = len(source_result.column_mapping)
 
-    c5, c6 = st.columns(2)
-    c5.metric("KPI formulas found", len(kpi_result.dependencies))
-    c6.metric("Source columns referenced by KPIs", len(kpi_result.referenced_canonicals))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Source Columns", total_source)
+    c2.metric("Referenced by KPIs", common_kpi + unique_kpi)
+    c3.metric("Common — KPI Required", common_kpi,
+              help="Columns present in >1 source workbook that are needed by KPI formulas")
+    c4.metric("Unique — KPI Required", unique_kpi,
+              help="Columns present in only 1 source workbook that are needed by KPI formulas")
+    c5.metric("Excluded (Not Required)", excluded_count,
+              help="Columns not referenced by any KPI — omitted from Master Source Data")
+
+    # Reconciliation check
+    reconciles = (common_kpi + unique_kpi + excluded_count) == total_source
+    if reconciles:
+        st.success(
+            f"✓ Metrics reconcile: {common_kpi} common + {unique_kpi} unique "
+            f"+ {excluded_count} excluded = {total_source} total"
+        )
+    else:
+        st.warning(
+            f"⚠ Reconciliation gap: {common_kpi} + {unique_kpi} + {excluded_count} "
+            f"= {common_kpi + unique_kpi + excluded_count} ≠ {total_source} total  "
+            "(some columns may map to canonicals not in column_profiles)"
+        )
 
     # ── Source column profiles ────────────────────────────────────────────────
     with st.expander("Source Column Profiles", expanded=True):
@@ -424,8 +451,8 @@ def _step_generate() -> None:
             )
             st.markdown("""
 **Contents:**
-- `01_Master_Source_Data` — KPI-referenced columns only, with lineage
-- `02_...` onwards — one recreated Summary tab per configured KPI tab
+- Master Source Data tab — KPI-referenced columns only, with lineage
+- One recreated Summary tab per configured KPI tab
 """)
 
         with col_dl2:

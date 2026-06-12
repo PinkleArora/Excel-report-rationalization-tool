@@ -647,7 +647,7 @@ def build_master_source_df(
     3. Resolve each duplicate group using KPI-usage scenarios (A/B/C/D).
     4. Drop columns resolved as REMOVE; keep columns resolved as KEEP.
     5. Rename remaining columns to canonical names.
-    6. Prepend lineage columns (Source_Workbook, Source_Sheet, LOB_Identifier).
+    6. Prepend lineage columns (Source_Workbook, Source_Sheet).
 
     Returns:
         ``(master_df, profiles)`` — profiles contain per-frame duplicate
@@ -712,7 +712,6 @@ def build_master_source_df(
         frame = frame.rename(columns=rename_map)
 
         # Prepend lineage columns
-        frame.insert(0, "LOB_Identifier", wb_cfg.lob_identifier or wb_cfg.workbook_name)
         frame.insert(0, "Source_Sheet", wb_cfg.source_tab)
         frame.insert(0, "Source_Workbook", bundle.file_name)
 
@@ -730,7 +729,7 @@ def build_master_source_df(
     blocking = [r for r in all_resolutions if r.scenario == "C"]
 
     if not frames:
-        return pd.DataFrame(columns=["Source_Workbook", "Source_Sheet", "LOB_Identifier"]), profiles
+        return pd.DataFrame(columns=["Source_Workbook", "Source_Sheet"]), profiles
 
     if blocking:
         raise DuplicateColumnError(all_resolutions)
@@ -752,9 +751,9 @@ def _build_column_remap(
 ) -> dict[str, str]:
     """Return {old_source_col_letter → new_master_col_letter}.
 
-    The master DataFrame has three prepended lineage columns
-    (Source_Workbook, Source_Sheet, LOB_Identifier) so canonical column
-    positions are offset by 3.
+    The master DataFrame has two prepended lineage columns
+    (Source_Workbook, Source_Sheet) so canonical column positions are
+    offset by 2.
     """
     master_cols = list(master_df.columns)
     remap: dict[str, str] = {}
@@ -889,8 +888,6 @@ def recreate_summary_sheet(
     old_source_tab: str,
     new_source_tab: str,
     col_remap: dict[str, str],
-    lob_value: str | None = None,
-    lob_col_letter: str = "C",
     old_self_tab: str | None = None,
 ) -> list[dict]:
     """Copy *raw_ws* into *wb_out* as a new sheet named *tab_name*.
@@ -946,8 +943,6 @@ def recreate_summary_sheet(
                     old_sheet=old_source_tab,
                     new_sheet=new_source_tab,
                     col_remap=col_remap,
-                    lob_value=lob_value,
-                    lob_col_letter=lob_col_letter,
                     old_self_sheet=old_self_tab,
                     new_self_sheet=tab_name,
                 )
@@ -1044,7 +1039,7 @@ def build_rationalized_workbook_bytes(
     wb.remove(wb.active)
 
     blocking_error: DuplicateColumnError | None = None
-    master_df = pd.DataFrame(columns=["Source_Workbook", "Source_Sheet", "LOB_Identifier"])
+    master_df = pd.DataFrame(columns=["Source_Workbook", "Source_Sheet"])
     profiles: list[SourceFrameProfile] = []
 
     try:
@@ -1054,27 +1049,21 @@ def build_rationalized_workbook_bytes(
         # Rebuild profiles using the resolutions the error carries
         profiles = _profiles_from_resolutions(bundles, config, source_result, kpi_result)
 
-    # Determine whether this is a multi-workbook consolidation (affects formula rewriting)
-    active_bundles = [b for b in bundles if config.config_for(b.file_name) is not None]
-    is_multi_workbook = len(active_bundles) > 1
+    master_tab_name = config.future_source_tab_name
 
-    # LOB column letter in Master Source Data is always C (col index 2)
-    lob_col_letter = "C"
-
-    # 01 — Master Source Data
-    ws_master = wb.create_sheet("01_Master_Source_Data")
+    # Master Source Data
+    ws_master = wb.create_sheet(master_tab_name)
     _write_df_to_sheet(ws_master, master_df, title="Master Source Data")
     if blocking_error:
         _write_warning_banner(
             ws_master,
             "⚠ Incomplete — Scenario C duplicates require manual review. "
-            "See 07_Duplicate_Column_Analysis.",
+            "See Duplicate_Column_Analysis.",
         )
 
-    # 02+ — Recreated Summary (reporting) tabs — the primary deliverable
-    # One tab per configured KPI tab, copied from the original worksheet with
-    # formulas rewritten to reference Master_Source_Data.
-    summary_counter = 2
+    # Recreated Summary (reporting) tabs — the primary deliverable.
+    # User-defined names are used exactly; auto-generated names get a numeric prefix.
+    auto_counter = 2
     audit_tabs_data: list[tuple[object, str, object, str]] = []  # (bundle, kpi_tab, audit_df, label)
     all_validation_rows: list[dict] = []
 
@@ -1084,12 +1073,12 @@ def build_rationalized_workbook_bytes(
             continue
         raw_wb = getattr(bundle, "_raw_wb", None)
         source_df = bundle.sheets.get(wb_cfg.source_tab)
-        lob_value = (wb_cfg.lob_identifier or bundle.file_name) if is_multi_workbook else None
 
         for kpi_tab in wb_cfg.kpi_tabs:
-            # Human-readable output tab name from user config (or auto-generated)
             summary_tab_name = config.kpi_tab_name_for(bundle.file_name, kpi_tab)
-            numbered_name = f"{summary_counter:02d}_{summary_tab_name}"[:31]
+            has_explicit = config.kpi_tab_has_explicit_name(bundle.file_name)
+            # Respect user-defined names exactly; number-prefix auto-generated ones
+            output_tab_name = summary_tab_name if has_explicit else f"{auto_counter:02d}_{summary_tab_name}"[:31]
 
             raw_ws = None
             if raw_wb is not None:
@@ -1110,29 +1099,24 @@ def build_rationalized_workbook_bytes(
                 val_rows = recreate_summary_sheet(
                     wb_out=wb,
                     raw_ws=raw_ws,
-                    tab_name=numbered_name,
+                    tab_name=output_tab_name,
                     old_source_tab=wb_cfg.source_tab,
-                    new_source_tab="01_Master_Source_Data",
+                    new_source_tab=master_tab_name,
                     col_remap=col_remap,
-                    lob_value=lob_value,
-                    lob_col_letter=lob_col_letter,
                     old_self_tab=kpi_tab,
                 )
                 all_validation_rows.extend(val_rows)
                 logger.info(
-                    "Recreated summary sheet '%s' from '%s/%s' "
-                    "(col_remap: %d mappings, lob_filter: %s)",
-                    numbered_name, bundle.file_name, kpi_tab,
-                    len(col_remap), lob_value or "none",
+                    "Recreated summary sheet '%s' from '%s/%s' (%d col remaps)",
+                    output_tab_name, bundle.file_name, kpi_tab, len(col_remap),
                 )
             else:
                 # Raw worksheet not available — fall back to audit DataFrame
                 logger.warning(
-                    "Raw worksheet not available for '%s/%s' — "
-                    "falling back to KPI audit tab",
+                    "Raw worksheet not available for '%s/%s' — falling back to KPI audit tab",
                     bundle.file_name, kpi_tab,
                 )
-                ws_fallback = wb.create_sheet(numbered_name)
+                ws_fallback = wb.create_sheet(output_tab_name)
                 fallback_df = build_kpi_audit_df(
                     bundle, kpi_tab, kpi_result, config.future_source_tab_name
                 )
@@ -1146,10 +1130,10 @@ def build_rationalized_workbook_bytes(
                 bundle, kpi_tab, kpi_result, config.future_source_tab_name
             )
             audit_tabs_data.append((bundle, kpi_tab, audit_df, summary_tab_name))
-            summary_counter += 1
+            auto_counter += 1
 
-    # Fixed analytical sheets — numbered after recreated summaries
-    base = summary_counter  # first available counter after all summary tabs
+    # Fixed analytical sheets — numbered after auto-generated summary tabs
+    base = auto_counter
 
     ws_map = wb.create_sheet(f"{base:02d}_Source_Mapping")
     _write_df_to_sheet(
@@ -1250,7 +1234,7 @@ def build_rationalized_workbook_pair(
     wb_ap.remove(wb_ap.active)
 
     blocking_error: DuplicateColumnError | None = None
-    master_df = pd.DataFrame(columns=["Source_Workbook", "Source_Sheet", "LOB_Identifier"])
+    master_df = pd.DataFrame(columns=["Source_Workbook", "Source_Sheet"])
     profiles: list[SourceFrameProfile] = []
 
     try:
@@ -1259,12 +1243,10 @@ def build_rationalized_workbook_pair(
         blocking_error = exc
         profiles = _profiles_from_resolutions(bundles, config, source_result, kpi_result)
 
-    active_bundles = [b for b in bundles if config.config_for(b.file_name) is not None]
-    is_multi_workbook = len(active_bundles) > 1
-    lob_col_letter = "C"
+    master_tab_name = config.future_source_tab_name
 
-    # ── Future-state: 01_Master_Source_Data ──────────────────────────────────
-    ws_master = wb_fs.create_sheet("01_Master_Source_Data")
+    # ── Future-state: Master Source Data ─────────────────────────────────────
+    ws_master = wb_fs.create_sheet(master_tab_name)
     _write_df_to_sheet(ws_master, master_df, title="Master Source Data")
     if blocking_error:
         _write_warning_banner(
@@ -1274,7 +1256,7 @@ def build_rationalized_workbook_pair(
         )
 
     # ── Future-state: recreated Summary tabs + collect audit data ─────────────
-    summary_counter = 2
+    auto_counter = 2
     audit_tabs_data: list[tuple[object, str, object, str]] = []
     all_validation_rows: list[dict] = []
 
@@ -1284,11 +1266,11 @@ def build_rationalized_workbook_pair(
             continue
         raw_wb = getattr(bundle, "_raw_wb", None)
         source_df = bundle.sheets.get(wb_cfg.source_tab)
-        lob_value = (wb_cfg.lob_identifier or bundle.file_name) if is_multi_workbook else None
 
         for kpi_tab in wb_cfg.kpi_tabs:
             summary_tab_name = config.kpi_tab_name_for(bundle.file_name, kpi_tab)
-            numbered_name = f"{summary_counter:02d}_{summary_tab_name}"[:31]
+            has_explicit = config.kpi_tab_has_explicit_name(bundle.file_name)
+            output_tab_name = summary_tab_name if has_explicit else f"{auto_counter:02d}_{summary_tab_name}"[:31]
 
             raw_ws = None
             if raw_wb is not None:
@@ -1308,27 +1290,23 @@ def build_rationalized_workbook_pair(
                 val_rows = recreate_summary_sheet(
                     wb_out=wb_fs,
                     raw_ws=raw_ws,
-                    tab_name=numbered_name,
+                    tab_name=output_tab_name,
                     old_source_tab=wb_cfg.source_tab,
-                    new_source_tab="01_Master_Source_Data",
+                    new_source_tab=master_tab_name,
                     col_remap=col_remap,
-                    lob_value=lob_value,
-                    lob_col_letter=lob_col_letter,
                     old_self_tab=kpi_tab,
                 )
                 all_validation_rows.extend(val_rows)
                 logger.info(
-                    "Recreated summary sheet '%s' from '%s/%s' "
-                    "(col_remap: %d mappings, lob_filter: %s)",
-                    numbered_name, bundle.file_name, kpi_tab,
-                    len(col_remap), lob_value or "none",
+                    "Recreated summary sheet '%s' from '%s/%s' (%d col remaps)",
+                    output_tab_name, bundle.file_name, kpi_tab, len(col_remap),
                 )
             else:
                 logger.warning(
                     "Raw worksheet not available for '%s/%s' — falling back to KPI audit tab",
                     bundle.file_name, kpi_tab,
                 )
-                ws_fallback = wb_fs.create_sheet(numbered_name)
+                ws_fallback = wb_fs.create_sheet(output_tab_name)
                 fallback_df = build_kpi_audit_df(
                     bundle, kpi_tab, kpi_result, config.future_source_tab_name
                 )
@@ -1341,7 +1319,7 @@ def build_rationalized_workbook_pair(
                 bundle, kpi_tab, kpi_result, config.future_source_tab_name
             )
             audit_tabs_data.append((bundle, kpi_tab, audit_df, summary_tab_name))
-            summary_counter += 1
+            auto_counter += 1
 
     # ── Analysis pack ─────────────────────────────────────────────────────────
     ap_counter = 1
@@ -1488,7 +1466,6 @@ def _profiles_from_resolutions(
         if cols_to_drop:
             frame = frame.drop(columns=cols_to_drop, errors="ignore")
         frame = frame.rename(columns=rename_map)
-        frame.insert(0, "LOB_Identifier", wb_cfg.lob_identifier or wb_cfg.workbook_name)
         frame.insert(0, "Source_Sheet", wb_cfg.source_tab)
         frame.insert(0, "Source_Workbook", bundle.file_name)
         profiles.append(SourceFrameProfile(
@@ -1597,7 +1574,6 @@ def _write_documentation(
             ("  Workbook",        wb_cfg.workbook_name),
             ("  Source Tab",      wb_cfg.source_tab),
             ("  KPI Tabs",        ", ".join(wb_cfg.kpi_tabs) or "(none)"),
-            ("  LOB Identifier",  wb_cfg.lob_identifier or "(none)"),
             ("", ""),
         ]
     rows += [
@@ -1632,11 +1608,11 @@ def _write_documentation(
         ("7. Master Source Data", ""),
         ("Total rows",                str(len(master_df))),
         ("Total columns (incl. lineage)", str(len(master_df.columns))),
-        ("Lineage columns",           "Source_Workbook, Source_Sheet, LOB_Identifier"),
+        ("Lineage columns",           "Source_Workbook, Source_Sheet"),
         ("", ""),
         ("8. BAU Update Instructions", ""),
-        ("Step 1", "Copy new source data rows into the Master_Source_Data tab."),
-        ("Step 2", "Ensure Source_Workbook, Source_Sheet, and LOB_Identifier are populated."),
+        ("Step 1", "Copy new source data rows into the Master Source Data tab."),
+        ("Step 2", "Ensure Source_Workbook and Source_Sheet are populated."),
         ("Step 3", "Update KPI formula range references to cover new rows."),
         ("Step 4", "Validate KPI outputs against original workbook totals."),
         ("Step 5", "Archive original workbooks — do not delete until reconciled."),

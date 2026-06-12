@@ -142,7 +142,7 @@ class SourceAnalysisResult:
             for canonical in dep.canonical_source_columns:
                 canonical_to_deps[canonical].append((future_name, dep.kpi_label))
 
-        _LINEAGE_COLS = {"Source_Workbook", "Source_Sheet", "LOB_Identifier"}
+        _LINEAGE_COLS = {"Source_Workbook", "Source_Sheet"}
         excl_set = set(self.excluded_columns)
         rows = []
         for (wb, tab, orig_col), canonical in self.column_mapping.items():

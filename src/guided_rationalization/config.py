@@ -12,7 +12,6 @@ class WorkbookTabConfig:
     workbook_name: str     # matches bundle.file_name
     source_tab: str        # the one tab that holds raw, transactional records
     kpi_tabs: list[str]    # one or more formula/summary tabs
-    lob_identifier: str = ""   # free-text LOB label added to every row in master source
 
 
 @dataclass
@@ -35,12 +34,22 @@ class RationalizationConfig:
     remove_unused_columns: bool = True
 
     def kpi_tab_name_for(self, workbook_name: str, tab_name: str) -> str:
-        """Return the configured output tab name for a KPI tab, or an auto-generated one."""
+        """Return the configured output tab name for a KPI tab.
+
+        If the user specified an explicit name for this workbook's KPI tab,
+        that name is returned exactly (no prefix, no truncation beyond Excel's
+        31-char limit).  Otherwise an auto-generated name is returned (the
+        caller may add a numeric prefix for ordering).
+        """
         explicit = self.future_kpi_tab_names.get(workbook_name)
         if explicit:
-            return explicit
+            return explicit[:31]
         stem = workbook_name.rsplit(".", 1)[0]
-        return f"{stem}_{tab_name}"[:31]  # Excel tab name max 31 chars
+        return f"{stem}_{tab_name}"[:31]
+
+    def kpi_tab_has_explicit_name(self, workbook_name: str) -> bool:
+        """True when the user supplied an explicit output tab name for this workbook."""
+        return bool(self.future_kpi_tab_names.get(workbook_name))
 
     def config_for(self, workbook_name: str) -> WorkbookTabConfig | None:
         for cfg in self.workbook_configs:

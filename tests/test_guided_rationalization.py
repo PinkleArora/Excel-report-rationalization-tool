@@ -93,8 +93,8 @@ def bundle_b():
 def config_two(bundle_a, bundle_b) -> RationalizationConfig:
     return RationalizationConfig(
         workbook_configs=[
-            WorkbookTabConfig("workbook_a.xlsx", "Data", [], "LOB-A"),
-            WorkbookTabConfig("workbook_b.xlsx", "Records", [], "LOB-B"),
+            WorkbookTabConfig("workbook_a.xlsx", "Data", []),
+            WorkbookTabConfig("workbook_b.xlsx", "Records", []),
         ],
         matching_threshold=80.0,
         remove_unused_columns=False,
@@ -116,7 +116,7 @@ def bundle_dup_normcol():
 def config_dup(bundle_dup_normcol) -> RationalizationConfig:
     return RationalizationConfig(
         workbook_configs=[
-            WorkbookTabConfig("dup_wb.xlsx", "Data", ["KPIs"], "LOB-DUP"),
+            WorkbookTabConfig("dup_wb.xlsx", "Data", ["KPIs"]),
         ],
         matching_threshold=80.0,
         remove_unused_columns=False,
@@ -402,14 +402,9 @@ class TestBuildMasterSourceDfClean:
     def test_lineage_columns_present(self, bundle_a, bundle_b, config_two):
         sr = analyze_source_data([bundle_a, bundle_b], config_two)
         master, _ = build_master_source_df([bundle_a, bundle_b], config_two, sr, _empty_kpi_result())
-        for col in ("Source_Workbook", "Source_Sheet", "LOB_Identifier"):
+        for col in ("Source_Workbook", "Source_Sheet"):
             assert col in master.columns
-
-    def test_lob_identifier_populated(self, bundle_a, bundle_b, config_two):
-        sr = analyze_source_data([bundle_a, bundle_b], config_two)
-        master, _ = build_master_source_df([bundle_a, bundle_b], config_two, sr, _empty_kpi_result())
-        assert "LOB-A" in master["LOB_Identifier"].values
-        assert "LOB-B" in master["LOB_Identifier"].values
+        assert "LOB_Identifier" not in master.columns
 
     def test_empty_bundles_returns_df(self, config_two):
         from src.guided_rationalization.source_analyzer import SourceAnalysisResult
@@ -605,7 +600,7 @@ class TestBuildRationalizedWorkbookBytes:
         names = pd.ExcelFile(io.BytesIO(data)).sheet_names
         # config_two has no KPI tabs, so base = 2 (01_Master_Source_Data + no summary sheets)
         for expected in (
-            "01_Master_Source_Data",
+            "Master_Source_Data",   # default future_source_tab_name
             "02_Source_Mapping",
             "03_Reconciliation",
             "04_Issues_Log",
