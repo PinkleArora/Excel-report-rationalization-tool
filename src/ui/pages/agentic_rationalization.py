@@ -9,7 +9,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from src.workbook_loader.loader import load_workbooks
+from src.ingestion.loader import load_workbook_from_bytes
 from src.agentic_rationalization.orchestrator import run_pipeline
 from src.agentic_rationalization.models import AgentResult, PipelineResult
 
@@ -151,10 +151,9 @@ def render() -> None:
 
     run_key = "agentic_pipeline_result"
     if st.button("▶ Run Agents", type="primary"):
-        file_objects = {f.name: io.BytesIO(f.read()) for f in uploaded}
         with st.spinner("Loading workbooks…"):
             try:
-                bundles = load_workbooks(file_objects)
+                bundles = [load_workbook_from_bytes(f.read(), file_name=f.name) for f in uploaded]
             except Exception as exc:
                 st.error(f"Failed to load workbooks: {exc}")
                 return
