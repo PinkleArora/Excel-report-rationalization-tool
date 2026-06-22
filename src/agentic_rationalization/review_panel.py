@@ -172,7 +172,11 @@ def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDe
                 continue
             signals = d.signals
             canonical_cols: list[str] = signals.get("canonical_source_cols", [])
-            # Only surface if no columns resolved OR cross-sheet (confidence ≤ 0.65)
+            formula_type: str = signals.get("formula_type", "SOURCE_BACKED")
+            # Only flag SOURCE_BACKED formulas that couldn't resolve their source columns.
+            # DERIVED/ROLLUP/VALIDATION formulas inherit lineage via tracing — never unresolved.
+            if formula_type != "SOURCE_BACKED":
+                continue
             if d.confidence > 0.65:
                 continue
 

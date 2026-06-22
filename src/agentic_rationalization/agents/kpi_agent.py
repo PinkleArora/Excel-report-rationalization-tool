@@ -73,6 +73,11 @@ def _describe_kpi(dep: KpiDependency) -> str:
 
 def _kpi_confidence(dep: KpiDependency) -> float:
     """Confidence that we correctly identified the KPI's source columns."""
+    formula_type = getattr(dep, "formula_type", "SOURCE_BACKED")
+    if formula_type in ("DERIVED", "ROLLUP", "VALIDATION"):
+        # Lineage is inherited from referenced cells — no source column lookup needed
+        return 0.92
+    # SOURCE_BACKED
     if not dep.canonical_source_columns:
         return 0.40   # formula found but no source columns resolved
     if not dep.refs_source_tab_only:
@@ -116,6 +121,8 @@ def run(
     for dep in kpi_result.dependencies:
         conf = _kpi_confidence(dep)
         description = _describe_kpi(dep)
+        formula_type = getattr(dep, "formula_type", "SOURCE_BACKED")
+        traced_from  = getattr(dep, "traced_from_cells", [])
         decisions.append(AgentDecision(
             subject=f"{dep.workbook_name} / {dep.kpi_tab} / {dep.cell_address}",
             decision=dep.kpi_label or dep.cell_address,
@@ -123,9 +130,11 @@ def run(
             reasoning=description,
             signals={
                 "formula":                dep.formula,
+                "formula_type":           formula_type,
                 "aggregate_function":     dep.aggregate_function,
                 "canonical_source_cols":  dep.canonical_source_columns,
                 "refs_source_tab_only":   dep.refs_source_tab_only,
+                "traced_from_cells":      traced_from,
             },
         ))
 
@@ -137,12 +146,14 @@ def run(
         )
 
     unresolved = [
-        d for d in kpi_result.dependencies if not d.canonical_source_columns
+        d for d in kpi_result.dependencies
+        if not d.canonical_source_columns
+        and getattr(d, "formula_type", "SOURCE_BACKED") == "SOURCE_BACKED"
     ]
     if unresolved:
         warnings.append(
-            f"{len(unresolved)} KPI formula(s) could not be resolved to source "
-            "columns — they may reference tabs not configured as source data."
+            f"{len(unresolved)} source-backed KPI formula(s) could not be resolved to "
+            "source columns — they may reference tabs not configured as source data."
         )
 
     logger.info(
