@@ -82,9 +82,10 @@ def run(
     # Call the existing builder
     fs_bytes: bytes | None = None
     ap_bytes: bytes | None = None
+    resolved_frames: list = []
 
     try:
-        fs_bytes, ap_bytes = build_rationalized_workbook_pair(
+        fs_bytes, ap_bytes, resolved_frames = build_rationalized_workbook_pair(
             bundles, config, source_result, kpi_result
         )
         decisions.append(AgentDecision(
@@ -97,6 +98,7 @@ def run(
         ))
     except DuplicateColumnError as dup_exc:
         ap_bytes = dup_exc.diagnostic_bytes
+        resolved_frames = []
         blocking = [r for r in dup_exc.resolutions if r.scenario == "C"]
         msg = (
             f"{len(blocking)} unresolvable duplicate column(s) require manual review. "
@@ -120,6 +122,7 @@ def run(
         import traceback as _tb
         tb_str = _tb.format_exc()
         logger.exception("GenerationAgent failed")
+        resolved_frames = []
         warnings.append(
             f"Generation failed: {type(exc).__name__}: {exc}\n\n{tb_str}"
         )
@@ -127,6 +130,6 @@ def run(
     return AgentResult(
         agent_name="GenerationAgent",
         decisions=decisions,
-        output=(fs_bytes, ap_bytes),
+        output=(fs_bytes, ap_bytes, resolved_frames),
         warnings=warnings,
     )

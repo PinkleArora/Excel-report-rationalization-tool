@@ -118,7 +118,10 @@ def run_pipeline(
     gen_result = generation_agent.run(bundles, config, source_analysis, kpi_analysis)
     _apply_overrides(gen_result, _overrides)
     agent_results.append(gen_result)
-    fs_bytes, ap_bytes = gen_result.output if isinstance(gen_result.output, tuple) else (None, None)
+    _gen_out = gen_result.output if isinstance(gen_result.output, tuple) else (None, None, [])
+    fs_bytes  = _gen_out[0] if len(_gen_out) > 0 else None
+    ap_bytes  = _gen_out[1] if len(_gen_out) > 1 else None
+    resolved_frames = _gen_out[2] if len(_gen_out) > 2 else []
 
     # Phase 6 — Validation (requires master DataFrame)
     master_df: pd.DataFrame | None = None
@@ -135,7 +138,11 @@ def run_pipeline(
         except Exception:
             logger.exception("Could not extract master DataFrame for validation")
 
-    val_result = validation_agent.run(bundles, config, kpi_analysis, master_df, tolerance=tolerance)
+    val_result = validation_agent.run(
+        bundles, config, kpi_analysis, master_df,
+        tolerance=tolerance,
+        resolved_source_frames=resolved_frames or None,
+    )
     _apply_overrides(val_result, _overrides)
     agent_results.append(val_result)
 

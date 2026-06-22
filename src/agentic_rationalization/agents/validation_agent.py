@@ -51,6 +51,7 @@ def run(
     kpi_result: KpiAnalysisResult | None,
     master_df: pd.DataFrame | None,
     tolerance: float = 0.01,
+    resolved_source_frames: list[pd.DataFrame] | None = None,
 ) -> AgentResult:
     """Reconcile numeric totals: original source tabs vs Master Source Data.
 
@@ -75,15 +76,20 @@ def run(
             warnings=["Validation skipped — master data or KPI result unavailable."],
         )
 
-    # Collect original source frames
-    source_frames: list[pd.DataFrame] = []
-    for bundle in bundles:
-        wb_cfg = config.config_for(bundle.file_name)
-        if wb_cfg is None:
-            continue
-        df = bundle.sheets.get(wb_cfg.source_tab)
-        if df is not None:
-            source_frames.append(df)
+    # Prefer resolved_source_frames (post-dedup) over raw bundle source frames.
+    # Raw frames may have duplicate canonical column names that crash the reconciler.
+    if resolved_source_frames is not None:
+        source_frames = resolved_source_frames
+    else:
+        # Fall back to raw source frames (with defensive dedup in reconciler)
+        source_frames = []
+        for bundle in bundles:
+            wb_cfg = config.config_for(bundle.file_name)
+            if wb_cfg is None:
+                continue
+            df = bundle.sheets.get(wb_cfg.source_tab)
+            if df is not None:
+                source_frames.append(df)
 
     if not source_frames:
         return AgentResult(

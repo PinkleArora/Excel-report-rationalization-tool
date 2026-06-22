@@ -681,14 +681,14 @@ def build_master_source_df(
             logger.warning("Source tab '%s' missing from '%s'", wb_cfg.source_tab, bundle.file_name)
             continue
 
-        # Build rename map (original_col → canonical) and excluded set
+        # Build rename map (original_col → canonical) and name-based exclusion set
         rename_map: dict[str, str] = {}
-        drop_cols: set[str] = set()
+        name_exclusions: set[str] = set()
         for col in df.columns:
             col_str = str(col)
             key = (bundle.file_name, wb_cfg.source_tab, col_str)
             if key in excl_set:
-                drop_cols.add(col_str)
+                name_exclusions.add(col_str)
             elif key in source_result.column_mapping:
                 rename_map[col_str] = source_result.column_mapping[key]
 
@@ -702,23 +702,56 @@ def build_master_source_df(
             bundle_resolutions.extend(resolutions)
             all_resolutions.extend(resolutions)
 
-        # Build the extra drop set from resolution decisions (REMOVE actions)
+        # Determine which column POSITIONS to drop.
+        # Use position-based (not name-based) dropping so that when two source columns
+        # share an identical original name, only the REMOVE position is dropped.
+        positions_to_drop: set[int] = set()
+
+        # Exclusions by name → find all matching positions
+        for pos, col in enumerate(df.columns):
+            if str(col) in name_exclusions:
+                positions_to_drop.add(pos)
+
+        # Resolution-based removes by position
         for r in bundle_resolutions:
             if r.action == "REMOVE":
-                orig_col = r.original_col_name
-                drop_cols.add(orig_col)
+                positions_to_drop.add(r.original_position)
                 logger.info(
                     "Scenario %s — removing '%s' (pos %d) from '%s'/'%s': %s",
-                    r.scenario, orig_col, r.original_position,
+                    r.scenario, r.original_col_name, r.original_position,
                     bundle.file_name, wb_cfg.source_tab, r.reason,
                 )
 
-        # Apply drops and renames
-        frame = df.copy()
-        cols_to_drop = [c for c in frame.columns if str(c) in drop_cols]
-        if cols_to_drop:
-            frame = frame.drop(columns=cols_to_drop, errors="ignore")
-        frame = frame.rename(columns=rename_map)
+        # Keep only surviving positions
+        keep_positions = [i for i in range(len(df.columns)) if i not in positions_to_drop]
+        frame = df.iloc[:, keep_positions].copy()
+
+        # Build new column names for kept positions (use canonical if available)
+        new_col_names = []
+        for pos in keep_positions:
+            orig = str(df.columns[pos])
+            new_col_names.append(rename_map.get(orig, orig))
+        frame.columns = new_col_names
+
+        # Safety net: assign unique suffixed names to any duplicate canonical names
+        # that survive into the frame (handles Scenario C and any edge cases).
+        seen_names: dict[str, int] = {}
+        unique_col_names: list[str] = []
+        for c in new_col_names:
+            if c in seen_names:
+                seen_names[c] += 1
+                unique_name = f"{c}_{seen_names[c]}"
+                logger.warning(
+                    "Duplicate canonical '%s' persists in '%s'/'%s' after resolution — "
+                    "assigned unique name '%s'",
+                    c, bundle.file_name, wb_cfg.source_tab, unique_name,
+                )
+                unique_col_names.append(unique_name)
+            else:
+                seen_names[c] = 1
+                unique_col_names.append(c)
+        if unique_col_names != new_col_names:
+            frame.columns = unique_col_names
 
         # Prepend lineage columns
         frame.insert(0, "Source_Sheet", wb_cfg.source_tab)
@@ -738,13 +771,19 @@ def build_master_source_df(
     blocking = [r for r in all_resolutions if r.scenario == "C"]
 
     if not frames:
-        return pd.DataFrame(columns=["Source_Workbook", "Source_Sheet"]), profiles
+        return pd.DataFrame(columns=["Source_Workbook", "Source_Sheet"]), profiles, []
 
     if blocking:
-        raise DuplicateColumnError(all_resolutions)
+        # Scenario C duplicates were auto-resolved with unique suffixed canonical names
+        # (see safety net above); log as warning rather than blocking generation.
+        names = sorted({r.canonical_name for r in blocking})
+        logger.warning(
+            "Scenario C duplicates auto-resolved with unique suffixed names: %s",
+            ", ".join(names),
+        )
 
     master = pd.concat(frames, axis=0, ignore_index=True, sort=False)
-    return master, profiles
+    return master, profiles, frames
 
 
 # ---------------------------------------------------------------------------
@@ -1050,11 +1089,13 @@ def build_rationalized_workbook_bytes(
     blocking_error: DuplicateColumnError | None = None
     master_df = pd.DataFrame(columns=["Source_Workbook", "Source_Sheet"])
     profiles: list[SourceFrameProfile] = []
+    resolved_frames: list = []
 
     try:
-        master_df, profiles = build_master_source_df(bundles, config, source_result, kpi_result)
+        master_df, profiles, resolved_frames = build_master_source_df(bundles, config, source_result, kpi_result)
     except DuplicateColumnError as exc:
         blocking_error = exc
+        resolved_frames = []
         # Rebuild profiles using the resolutions the error carries
         profiles = _profiles_from_resolutions(bundles, config, source_result, kpi_result)
 
@@ -1245,11 +1286,13 @@ def build_rationalized_workbook_pair(
     blocking_error: DuplicateColumnError | None = None
     master_df = pd.DataFrame(columns=["Source_Workbook", "Source_Sheet"])
     profiles: list[SourceFrameProfile] = []
+    resolved_frames: list = []
 
     try:
-        master_df, profiles = build_master_source_df(bundles, config, source_result, kpi_result)
+        master_df, profiles, resolved_frames = build_master_source_df(bundles, config, source_result, kpi_result)
     except DuplicateColumnError as exc:
         blocking_error = exc
+        resolved_frames = []
         profiles = _profiles_from_resolutions(bundles, config, source_result, kpi_result)
 
     master_tab_name = config.future_source_tab_name
@@ -1428,7 +1471,7 @@ def build_rationalized_workbook_pair(
         blocking_error.diagnostic_bytes = ap_bytes
         raise blocking_error
 
-    return fs_bytes, ap_bytes
+    return fs_bytes, ap_bytes, resolved_frames
 
 
 # ---------------------------------------------------------------------------

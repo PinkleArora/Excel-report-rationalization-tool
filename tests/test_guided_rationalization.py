@@ -396,12 +396,12 @@ class TestAnalyzeKpiDependencies:
 class TestBuildMasterSourceDfClean:
     def test_combines_rows(self, bundle_a, bundle_b, config_two):
         sr = analyze_source_data([bundle_a, bundle_b], config_two)
-        master, _ = build_master_source_df([bundle_a, bundle_b], config_two, sr, _empty_kpi_result())
+        master, _, _ = build_master_source_df([bundle_a, bundle_b], config_two, sr, _empty_kpi_result())
         assert len(master) == 4
 
     def test_lineage_columns_present(self, bundle_a, bundle_b, config_two):
         sr = analyze_source_data([bundle_a, bundle_b], config_two)
-        master, _ = build_master_source_df([bundle_a, bundle_b], config_two, sr, _empty_kpi_result())
+        master, _, _ = build_master_source_df([bundle_a, bundle_b], config_two, sr, _empty_kpi_result())
         for col in ("Source_Workbook", "Source_Sheet"):
             assert col in master.columns
         assert "LOB_Identifier" not in master.columns
@@ -409,7 +409,7 @@ class TestBuildMasterSourceDfClean:
     def test_empty_bundles_returns_df(self, config_two):
         from src.guided_rationalization.source_analyzer import SourceAnalysisResult
         empty_sr = SourceAnalysisResult(column_profiles=[], column_mapping={}, excluded_columns=[])
-        master, profiles = build_master_source_df([], config_two, empty_sr, _empty_kpi_result())
+        master, profiles, _ = build_master_source_df([], config_two, empty_sr, _empty_kpi_result())
         assert isinstance(master, pd.DataFrame)
         assert profiles == []
 
@@ -425,7 +425,7 @@ class TestBuildMasterSourceScenarioA:
         kpi_result = _kpi_result_with_refs([
             ("dup_wb.xlsx", "KPIs", "B2", ("Data", "A")),
         ])
-        master, profiles = build_master_source_df(
+        master, profiles, _ = build_master_source_df(
             [bundle_dup_normcol], config_dup, sr, kpi_result
         )
         # Should succeed without raising
@@ -438,7 +438,7 @@ class TestBuildMasterSourceScenarioA:
         kpi_result = _kpi_result_with_refs([
             ("dup_wb.xlsx", "KPIs", "B2", ("Data", "A")),
         ])
-        _, profiles = build_master_source_df(
+        _, profiles, _ = build_master_source_df(
             [bundle_dup_normcol], config_dup, sr, kpi_result
         )
         assert any(r.scenario == "A" for p in profiles for r in p.resolutions)
@@ -452,7 +452,7 @@ class TestBuildMasterSourceScenarioB:
     def test_both_removed_automatically(self, bundle_dup_normcol, config_dup):
         sr = analyze_source_data([bundle_dup_normcol], config_dup)
         # No KPI references at all
-        master, profiles = build_master_source_df(
+        master, profiles, _ = build_master_source_df(
             [bundle_dup_normcol], config_dup, sr, _empty_kpi_result()
         )
         assert isinstance(master, pd.DataFrame)
@@ -460,7 +460,7 @@ class TestBuildMasterSourceScenarioB:
 
     def test_resolution_scenario_b_in_profile(self, bundle_dup_normcol, config_dup):
         sr = analyze_source_data([bundle_dup_normcol], config_dup)
-        _, profiles = build_master_source_df(
+        _, profiles, _ = build_master_source_df(
             [bundle_dup_normcol], config_dup, sr, _empty_kpi_result()
         )
         assert any(r.scenario == "B" for p in profiles for r in p.resolutions)
@@ -471,25 +471,28 @@ class TestBuildMasterSourceScenarioB:
 # ---------------------------------------------------------------------------
 
 class TestBuildMasterSourceScenarioC:
-    def test_raises_duplicate_column_error(self, bundle_dup_normcol, config_dup):
+    def test_scenario_c_auto_resolves_with_unique_names(self, bundle_dup_normcol, config_dup):
         sr = analyze_source_data([bundle_dup_normcol], config_dup)
         kpi_result = _kpi_result_with_refs([
             ("dup_wb.xlsx", "KPIs", "B2", ("Data", "A")),
             ("dup_wb.xlsx", "KPIs", "C3", ("Data", "B")),
         ])
-        with pytest.raises(DuplicateColumnError) as exc_info:
-            build_master_source_df([bundle_dup_normcol], config_dup, sr, kpi_result)
-        assert any(r.scenario == "C" for r in exc_info.value.resolutions)
+        # Should NOT raise — auto-resolves with unique suffixed names
+        master, profiles, resolved = build_master_source_df([bundle_dup_normcol], config_dup, sr, kpi_result)
+        assert isinstance(master, pd.DataFrame)
+        cols = list(master.columns)
+        # One column keeps the base canonical, the other gets _2 suffix
+        assert "policy_number" in cols
+        assert "policy_number_2" in cols
 
-    def test_error_message_names_workbook(self, bundle_dup_normcol, config_dup):
+    def test_scenario_c_resolutions_recorded_in_profile(self, bundle_dup_normcol, config_dup):
         sr = analyze_source_data([bundle_dup_normcol], config_dup)
         kpi_result = _kpi_result_with_refs([
             ("dup_wb.xlsx", "KPIs", "B2", ("Data", "A")),
             ("dup_wb.xlsx", "KPIs", "C3", ("Data", "B")),
         ])
-        with pytest.raises(DuplicateColumnError) as exc_info:
-            build_master_source_df([bundle_dup_normcol], config_dup, sr, kpi_result)
-        assert "dup_wb.xlsx" in str(exc_info.value)
+        _, profiles, _ = build_master_source_df([bundle_dup_normcol], config_dup, sr, kpi_result)
+        assert any(r.scenario == "C" for p in profiles for r in p.resolutions)
 
 
 # ---------------------------------------------------------------------------
@@ -627,32 +630,32 @@ class TestBuildRationalizedWorkbookBytes:
         )
         assert isinstance(data, bytes)
 
-    def test_scenario_c_raises_with_diagnostic_bytes(self, bundle_dup_normcol, config_dup):
+    def test_scenario_c_auto_resolves_no_raise(self, bundle_dup_normcol, config_dup):
         sr = analyze_source_data([bundle_dup_normcol], config_dup)
         kpi_result = _kpi_result_with_refs([
             ("dup_wb.xlsx", "KPIs", "B2", ("Data", "A")),
             ("dup_wb.xlsx", "KPIs", "C3", ("Data", "B")),
         ])
-        with pytest.raises(DuplicateColumnError) as exc_info:
-            build_rationalized_workbook_bytes(
-                [bundle_dup_normcol], config_dup, sr, kpi_result
-            )
-        assert exc_info.value.diagnostic_bytes is not None
-        xl = pd.ExcelFile(io.BytesIO(exc_info.value.diagnostic_bytes))
-        assert any("Duplicate_Column_Analysis" in s for s in xl.sheet_names)
+        # Scenario C now auto-resolves with unique suffixed names — should NOT raise
+        result = build_rationalized_workbook_bytes(
+            [bundle_dup_normcol], config_dup, sr, kpi_result
+        )
+        assert isinstance(result, bytes)
 
-    def test_scenario_c_error_carries_resolutions(self, bundle_dup_normcol, config_dup):
+    def test_scenario_c_workbook_contains_both_columns(self, bundle_dup_normcol, config_dup):
         sr = analyze_source_data([bundle_dup_normcol], config_dup)
         kpi_result = _kpi_result_with_refs([
             ("dup_wb.xlsx", "KPIs", "B2", ("Data", "A")),
             ("dup_wb.xlsx", "KPIs", "C3", ("Data", "B")),
         ])
-        with pytest.raises(DuplicateColumnError) as exc_info:
-            build_rationalized_workbook_bytes(
-                [bundle_dup_normcol], config_dup, sr, kpi_result
-            )
-        blocking = [r for r in exc_info.value.resolutions if r.scenario == "C"]
-        assert len(blocking) > 0
+        result = build_rationalized_workbook_bytes(
+            [bundle_dup_normcol], config_dup, sr, kpi_result
+        )
+        xl = pd.ExcelFile(io.BytesIO(result))
+        master_tab = config_dup.future_source_tab_name
+        df = xl.parse(master_tab, header=1)
+        assert "policy_number" in df.columns
+        assert "policy_number_2" in df.columns
 
 
 # ---------------------------------------------------------------------------
