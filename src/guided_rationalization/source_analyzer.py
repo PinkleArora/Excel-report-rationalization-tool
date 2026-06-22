@@ -195,6 +195,9 @@ def analyze_source_data(
     bundles: list,
     config: RationalizationConfig,
     kpi_referenced_canonicals: set[str] | None = None,
+    force_merge: dict[str, str] | None = None,
+    force_separate: set[str] | None = None,
+    force_exclude: set[str] | None = None,
 ) -> SourceAnalysisResult:
     """Classify every source column as COMMON, SIMILAR, or UNIQUE.
 
@@ -204,10 +207,18 @@ def analyze_source_data(
         kpi_referenced_canonicals: Canonical names referenced by at least one KPI formula.
             Used to populate ``is_kpi_referenced`` and — when
             ``config.remove_unused_columns`` is True — to determine exclusions.
+        force_merge: ``{canonical_a: canonical_target}`` — override similar columns to
+            be treated as common, mapped to ``canonical_target``.
+        force_separate: Canonical names that must NOT be merged even if fuzzy score is
+            above the threshold.
+        force_exclude: Canonical names to add to the excluded list regardless of KPI usage.
 
     Returns:
         :class:`SourceAnalysisResult` with profiles, column map, and exclusions.
     """
+    _force_merge:    dict[str, str] = force_merge    or {}
+    _force_separate: set[str]       = force_separate or set()
+    _force_exclude:  set[str]       = force_exclude  or set()
     # 1. Collect (workbook, tab, original_col, normalized_col, dtype) entries
     entries: list[tuple[str, str, str, str, str]] = []
     for bundle in bundles:
@@ -265,6 +276,9 @@ def analyze_source_data(
         similar_group = [norm_a]
         for norm_b in unclaimed_norms[i + 1:]:
             if norm_b in merged_in_similar:
+                continue
+            # Honour force_separate: skip fuzzy match for explicitly separated pairs
+            if norm_a in _force_separate or norm_b in _force_separate:
                 continue
             score = fuzz.WRatio(norm_a, norm_b)
             if score >= config.matching_threshold:
@@ -325,6 +339,41 @@ def analyze_source_data(
                 column_mapping[(wb, tab, orig)] = norm_a
             merged_in_similar.add(norm_a)
 
+    # 2c. Apply force_merge overrides: reclassify similar pairs as common
+    if _force_merge:
+        # Collect all target canonicals that have at least one source mapped to them
+        for canonical_src, canonical_tgt in _force_merge.items():
+            # Find source profile
+            src_profile = next(
+                (p for p in column_profiles if p.canonical_name == canonical_src), None
+            )
+            tgt_profile = next(
+                (p for p in column_profiles if p.canonical_name == canonical_tgt), None
+            )
+            if src_profile is None:
+                continue
+            if tgt_profile is None:
+                # Rename src_profile to target canonical and reclassify
+                src_profile.canonical_name = canonical_tgt
+                src_profile.match_class = "common"
+                for key, val in list(column_mapping.items()):
+                    if val == canonical_src:
+                        column_mapping[key] = canonical_tgt
+            else:
+                # Merge src entries into tgt profile
+                tgt_profile.source_entries = list(
+                    dict.fromkeys(tgt_profile.source_entries + src_profile.source_entries)
+                )
+                tgt_profile.match_class = "common"
+                tgt_profile.similar_to = [
+                    s for s in tgt_profile.similar_to if s != canonical_src
+                ]
+                for key, val in list(column_mapping.items()):
+                    if val == canonical_src:
+                        column_mapping[key] = canonical_tgt
+                # Remove the source profile (it's been merged into target)
+                column_profiles[:] = [p for p in column_profiles if p.canonical_name != canonical_src]
+
     # 3. Mark KPI-referenced columns
     if kpi_referenced_canonicals:
         for profile in column_profiles:
@@ -336,6 +385,12 @@ def analyze_source_data(
     if config.remove_unused_columns and kpi_referenced_canonicals is not None:
         for (wb, tab, orig), canonical in column_mapping.items():
             if canonical not in kpi_referenced_canonicals:
+                excluded.append((wb, tab, orig))
+
+    # Apply force_exclude overrides (unconditional exclusion by canonical name)
+    if _force_exclude:
+        for (wb, tab, orig), canonical in column_mapping.items():
+            if canonical in _force_exclude and (wb, tab, orig) not in excluded:
                 excluded.append((wb, tab, orig))
 
     logger.info(

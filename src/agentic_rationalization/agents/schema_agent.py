@@ -86,6 +86,9 @@ def run(
     bundles: list,
     config: RationalizationConfig,
     kpi_result: KpiAnalysisResult | None,
+    force_merge: dict[str, str] | None = None,
+    force_separate: set[str] | None = None,
+    force_exclude: set[str] | None = None,
 ) -> AgentResult:
     """Classify source columns with a KPI-usage veto on fuzzy merges.
 
@@ -93,6 +96,9 @@ def run(
         bundles: Loaded WorkbookBundle objects.
         config: RationalizationConfig (from Discovery Agent or user).
         kpi_result: KPI analysis from the KPI Agent (may be None).
+        force_merge: ``{canonical_a: canonical_target}`` user-directed merges.
+        force_separate: Canonical names the user directed to keep separate.
+        force_exclude: Canonical names the user directed to exclude.
 
     Returns:
         AgentResult whose ``output`` is a :class:`SourceAnalysisResult`.
@@ -116,7 +122,11 @@ def run(
     # Run source analysis with KPI refs for exclusion decisions
     try:
         source_result: SourceAnalysisResult = analyze_source_data(
-            bundles, config, kpi_referenced_canonicals=kpi_referenced
+            bundles, config,
+            kpi_referenced_canonicals=kpi_referenced,
+            force_merge=force_merge,
+            force_separate=force_separate,
+            force_exclude=force_exclude,
         )
     except Exception as exc:
         logger.exception("SchemaAgent failed during source analysis")
@@ -166,13 +176,17 @@ def run(
             confidence=conf,
             reasoning=_reasoning(profile, is_kpi_ref, veto, kpi_labels),
             signals={
-                "match_class":         profile.match_class,
-                "present_in_count":    profile.present_in_count,
+                "match_class":          profile.match_class,
+                "present_in_count":     profile.present_in_count,
                 "present_in_workbooks": profile.present_in_workbooks,
-                "similar_to":          profile.similar_to,
-                "is_kpi_referenced":   is_kpi_ref,
-                "kpi_labels":          kpi_labels,
-                "kpi_veto_applied":    veto,
+                "similar_to":           profile.similar_to,
+                "is_kpi_referenced":    is_kpi_ref,
+                "kpi_labels":           kpi_labels,
+                "kpi_veto_applied":     veto,
+                # enriched for review panel (original names + workbook context)
+                "canonical_name":       profile.canonical_name,
+                "source_entries":       list(profile.source_entries),
+                "workbooks":            profile.present_in_workbooks,
             },
         ))
 

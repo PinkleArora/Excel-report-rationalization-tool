@@ -13,6 +13,13 @@ import streamlit as st
 from src.ingestion.loader import load_workbook_from_bytes
 from src.agentic_rationalization.orchestrator import run_pipeline
 from src.agentic_rationalization.models import AgentResult, PipelineResult
+from src.agentic_rationalization.review_panel import (
+    ActionableDecision,
+    classify_actionable_decisions,
+    SIMILAR_COLUMN_ACTIONS,
+    KPI_UNRESOLVED_ACTIONS,
+    CONSOLIDATION_ACTIONS,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -67,89 +74,242 @@ def _render_agent_card(result: AgentResult) -> None:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-# ── Override UI ───────────────────────────────────────────────────────────────
+# ── Review panel ─────────────────────────────────────────────────────────────
 
-_OVERRIDES_KEY = "agentic_decision_overrides"
-
-
-def _override_field_key(agent_name: str, subject: str) -> str:
-    """Stable widget key for a single override field."""
-    safe = (agent_name + "__" + subject).replace(" ", "_").replace("/", "_")
-    return f"ovr_{safe}"[:128]
+_OVERRIDES_KEY     = "agentic_decision_overrides"    # generic text overrides
+_ACTION_KEY        = "agentic_action_overrides"      # structured action choices
 
 
-def _render_overrides(pipeline: PipelineResult) -> None:
-    """Display every overridable agent decision as an editable field.
+def _widget_key(prefix: str, subject: str) -> str:
+    safe = subject.replace(" ", "_").replace("/", "_").replace("'", "")
+    return f"{prefix}_{safe}"[:120]
 
-    Values are stored in st.session_state[_OVERRIDES_KEY] so they survive
-    re-runs and are passed back into the pipeline.
+
+# ── Per-type card renderers ───────────────────────────────────────────────────
+
+def _render_similar_column_card(ad: ActionableDecision, idx: int) -> None:
+    saved_actions: dict[str, str] = st.session_state.get(_ACTION_KEY, {})
+    current_action = saved_actions.get(ad.subject, "ACCEPT")
+
+    icon = _conf_color(ad.confidence)
+    with st.container(border=True):
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(
+                f"**{icon} Similar Column Match** — confidence `{ad.confidence:.0%}`"
+            )
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**Column A**")
+                st.code(ad.canonical_a, language=None)
+                if ad.original_names_a:
+                    st.caption("Original name(s): " + " · ".join(ad.original_names_a[:3]))
+                if ad.workbooks_a:
+                    st.caption("Workbook: " + ", ".join(ad.workbooks_a[:2]))
+            with col_b:
+                st.markdown("**Column B**")
+                st.code(ad.canonical_b or "—", language=None)
+                if ad.original_names_b:
+                    st.caption("Original name(s): " + " · ".join(ad.original_names_b[:3]))
+                if ad.workbooks_b:
+                    st.caption("Workbook: " + ", ".join(ad.workbooks_b[:2]))
+            if ad.kpi_labels:
+                st.caption(f"Affected KPIs: {', '.join(ad.kpi_labels[:4])}")
+            if ad.description and "KPI veto" in ad.description:
+                st.warning("KPI veto applied — these columns are used by different KPI formulas.")
+        with c2:
+            st.markdown("**Agent recommendation:**")
+            st.info(ad.current_recommendation)
+
+        key = _widget_key("sim", ad.subject)
+        default_idx = next(
+            (i for i, (k, _) in enumerate(ad.available_actions) if k == current_action), 0
+        )
+        labels = [label for _, label in ad.available_actions]
+        chosen_label = st.radio(
+            "Your decision:",
+            labels,
+            index=default_idx,
+            key=key,
+            horizontal=False,
+        )
+        chosen_key = next(k for k, l in ad.available_actions if l == chosen_label)
+
+        # Persist immediately
+        if _ACTION_KEY not in st.session_state:
+            st.session_state[_ACTION_KEY] = {}
+        st.session_state[_ACTION_KEY][ad.subject] = chosen_key
+
+        # Record as annotation override too (for decision log)
+        if chosen_key != "ACCEPT":
+            if _OVERRIDES_KEY not in st.session_state:
+                st.session_state[_OVERRIDES_KEY] = {}
+            st.session_state[_OVERRIDES_KEY].setdefault(ad.agent_name, {})[ad.subject] = chosen_key
+
+
+def _render_kpi_unresolved_card(ad: ActionableDecision, idx: int) -> None:
+    saved_actions: dict[str, str] = st.session_state.get(_ACTION_KEY, {})
+    current_action = saved_actions.get(ad.subject, "ACCEPT")
+
+    with st.container(border=True):
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(
+                f"**🔴 Unresolved KPI Formula** — `{ad.cell_address}` in `{ad.kpi_tab}`"
+            )
+            st.caption(ad.description)
+            if ad.formula:
+                st.code(ad.formula, language=None)
+        with c2:
+            st.markdown("**Confidence:**")
+            st.error(f"{ad.confidence:.0%}")
+
+        key_radio = _widget_key("kpi", ad.subject)
+        default_idx = next(
+            (i for i, (k, _) in enumerate(ad.available_actions) if k == current_action), 0
+        )
+        labels = [label for _, label in ad.available_actions]
+        chosen_label = st.radio(
+            "Your decision:",
+            labels,
+            index=default_idx,
+            key=key_radio,
+            horizontal=False,
+        )
+        chosen_key = next(k for k, l in ad.available_actions if l == chosen_label)
+
+        manual_col = ""
+        if chosen_key == "MANUAL_COLUMN":
+            saved_manual = st.session_state.get(_OVERRIDES_KEY, {}).get(ad.agent_name, {}).get(ad.subject, "")
+            manual_col = st.text_input(
+                "Source column name (canonical or original):",
+                value=saved_manual if saved_manual not in ("SKIP", "ACCEPT") else "",
+                key=_widget_key("kpi_manual", ad.subject),
+                placeholder="e.g. statutory_reserves_total",
+            )
+
+        if _ACTION_KEY not in st.session_state:
+            st.session_state[_ACTION_KEY] = {}
+        st.session_state[_ACTION_KEY][ad.subject] = chosen_key
+        if chosen_key != "ACCEPT":
+            annotation = manual_col if chosen_key == "MANUAL_COLUMN" and manual_col else chosen_key
+            if _OVERRIDES_KEY not in st.session_state:
+                st.session_state[_OVERRIDES_KEY] = {}
+            st.session_state[_OVERRIDES_KEY].setdefault(ad.agent_name, {})[ad.subject] = annotation
+
+
+def _render_consolidation_card(ad: ActionableDecision, idx: int) -> None:
+    saved_actions: dict[str, str] = st.session_state.get(_ACTION_KEY, {})
+    current_action = saved_actions.get(ad.subject, "ACCEPT")
+
+    icon = _conf_color(ad.confidence)
+    wb_a, wb_b = ad.workbook_pair
+    with st.container(border=True):
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(
+                f"**{icon} Consolidation Uncertainty** — `{wb_a}` ↔ `{wb_b}`"
+            )
+            st.caption(f"Column overlap: **{ad.overlap_pct:.1f}%**")
+            if ad.grain_issue:
+                st.warning(f"Grain issue: {ad.grain_issue}")
+            else:
+                st.caption(ad.description)
+        with c2:
+            st.markdown("**Agent recommendation:**")
+            st.info(ad.current_recommendation)
+
+        key = _widget_key("consol", ad.subject)
+        default_idx = next(
+            (i for i, (k, _) in enumerate(ad.available_actions) if k == current_action), 0
+        )
+        labels = [label for _, label in ad.available_actions]
+        chosen_label = st.radio(
+            "Your decision:",
+            labels,
+            index=default_idx,
+            key=key,
+            horizontal=False,
+        )
+        chosen_key = next(k for k, l in ad.available_actions if l == chosen_label)
+
+        if _ACTION_KEY not in st.session_state:
+            st.session_state[_ACTION_KEY] = {}
+        st.session_state[_ACTION_KEY][ad.subject] = chosen_key
+        if chosen_key != "ACCEPT":
+            if _OVERRIDES_KEY not in st.session_state:
+                st.session_state[_OVERRIDES_KEY] = {}
+            st.session_state[_OVERRIDES_KEY].setdefault(ad.agent_name, {})[ad.subject] = chosen_key
+
+
+# ── Main review panel ─────────────────────────────────────────────────────────
+
+def _render_review_panel(pipeline: PipelineResult) -> None:
+    """Structured review panel — surfaces specific low-confidence decisions
+    as typed cards with radio-button action choices.
     """
-    st.subheader("User Overrides")
+    st.subheader("Step 4 — Review & Resolve Decisions")
     st.caption(
-        "All decisions marked **Overridable = Yes** are shown below.  "
-        "Leave a field blank (or unchanged) to accept the agent recommendation.  "
-        "Click **Re-run with overrides** to regenerate the output."
+        "Decisions below require your input. Each card shows exactly what the agent "
+        "is uncertain about and offers concrete choices. "
+        "Click **Re-run with overrides** after making your selections."
     )
 
-    # Collect every overridable decision across all agents
-    overridable = [
-        (result.agent_name, d)
-        for result in pipeline.agent_results
-        for d in result.decisions
-        if d.overridable
-    ]
+    actionable = classify_actionable_decisions(pipeline)
 
-    if not overridable:
-        st.info("No overridable decisions found in this pipeline run.")
+    if not actionable:
+        st.success(
+            "All decisions have high confidence (≥ 90%). "
+            "No manual review required — you can proceed to download the outputs."
+        )
         return
 
-    # Group by agent for readability
-    overridable_sorted = sorted(overridable, key=lambda x: x[0])
-    saved: dict[str, dict[str, str]] = st.session_state.get(_OVERRIDES_KEY, {})
+    # Count by type
+    n_sim   = sum(1 for a in actionable if a.action_type == "SIMILAR_COLUMN")
+    n_kpi   = sum(1 for a in actionable if a.action_type == "KPI_UNRESOLVED")
+    n_con   = sum(1 for a in actionable if a.action_type == "CONSOLIDATION_PAIR")
 
-    for agent_name, group in groupby(overridable_sorted, key=lambda x: x[0]):
-        decisions_in_group = [d for _, d in group]
-        # Skip agents whose decisions are all high-confidence (≥ 0.95) — read-only
-        all_high = all(d.confidence >= 0.95 for d in decisions_in_group)
-        if all_high:
-            with st.expander(
-                f"🔒 {agent_name} — {len(decisions_in_group)} decision(s), all high-confidence (read-only)",
-                expanded=False,
-            ):
-                st.caption("These decisions have ≥ 95% confidence and are shown for information only.")
-                for d in decisions_in_group:
-                    st.markdown(
-                        f"**{d.subject}** → `{d.decision}` "
-                        f"({d.confidence:.0%} confidence)"
-                    )
-            continue
+    tab_labels = []
+    if n_sim:
+        tab_labels.append(f"🔀 Similar Columns ({n_sim})")
+    if n_kpi:
+        tab_labels.append(f"❓ Unresolved KPI Mappings ({n_kpi})")
+    if n_con:
+        tab_labels.append(f"⚖️ Consolidation Decisions ({n_con})")
 
-        with st.expander(
-            f"✏️ {agent_name} — {len(decisions_in_group)} overridable decision(s)",
-            expanded=True,
-        ):
-            agent_saved = saved.get(agent_name, {})
-            for d in decisions_in_group:
-                conf_icon = _conf_color(d.confidence)
-                st.markdown(
-                    f"{conf_icon} **{d.subject}** &nbsp;&nbsp; "
-                    f"Confidence: `{d.confidence:.0%}`"
-                )
-                st.caption(d.reasoning)
-                field_key = _override_field_key(agent_name, d.subject)
-                existing = agent_saved.get(d.subject, "")
-                new_val = st.text_input(
-                    label=f"Agent decision: `{d.decision}`",
-                    value=existing,
-                    placeholder=f"Leave blank to accept: {d.decision}",
-                    key=field_key,
-                )
-                # Persist to session_state immediately on each interaction
-                if new_val != existing:
-                    if _OVERRIDES_KEY not in st.session_state:
-                        st.session_state[_OVERRIDES_KEY] = {}
-                    st.session_state[_OVERRIDES_KEY].setdefault(agent_name, {})[d.subject] = new_val
-                st.divider()
+    tabs = st.tabs(tab_labels) if len(tab_labels) > 1 else [st.container()]
+    tab_iter = iter(tabs)
+
+    if n_sim:
+        with next(tab_iter):
+            st.caption(
+                "These column pairs have similar names. "
+                "Decide whether they represent the same business concept (merge) "
+                "or different concepts (keep separate)."
+            )
+            sim_items = [a for a in actionable if a.action_type == "SIMILAR_COLUMN"]
+            for i, ad in enumerate(sim_items):
+                _render_similar_column_card(ad, i)
+
+    if n_kpi:
+        with next(tab_iter):
+            st.caption(
+                "These KPI formulas could not be resolved to source columns. "
+                "You can skip them or specify the source column manually."
+            )
+            kpi_items = [a for a in actionable if a.action_type == "KPI_UNRESOLVED"]
+            for i, ad in enumerate(kpi_items):
+                _render_kpi_unresolved_card(ad, i)
+
+    if n_con:
+        with next(tab_iter):
+            st.caption(
+                "These workbook pairs have low schema overlap. "
+                "Decide whether to consolidate them or keep them separate."
+            )
+            con_items = [a for a in actionable if a.action_type == "CONSOLIDATION_PAIR"]
+            for i, ad in enumerate(con_items):
+                _render_consolidation_card(ad, i)
 
 
 # ── Main page ─────────────────────────────────────────────────────────────────
@@ -193,7 +353,7 @@ def render() -> None:
         help="Apply any overrides entered below and regenerate the output.",
     )
 
-    def _execute_pipeline(overrides: dict | None) -> None:
+    def _execute_pipeline(decision_overrides: dict | None, action_overrides: dict | None) -> None:
         with st.spinner("Loading workbooks…"):
             try:
                 bundles = [load_workbook_from_bytes(f.read(), file_name=f.name) for f in uploaded]
@@ -205,7 +365,8 @@ def render() -> None:
                 result = run_pipeline(
                     bundles,
                     tolerance=tolerance,
-                    decision_overrides=overrides,
+                    decision_overrides=decision_overrides,
+                    action_overrides=action_overrides,
                 )
                 st.session_state[run_key] = result
                 st.session_state["agentic_bundles"] = bundles
@@ -213,10 +374,14 @@ def render() -> None:
                 st.error(f"Pipeline error: {exc}")
 
     if run_clicked:
-        st.session_state.pop(_OVERRIDES_KEY, None)  # clear any stale overrides on fresh run
-        _execute_pipeline(None)
+        st.session_state.pop(_OVERRIDES_KEY, None)
+        st.session_state.pop(_ACTION_KEY, None)
+        _execute_pipeline(None, None)
     elif rerun_clicked:
-        _execute_pipeline(st.session_state.get(_OVERRIDES_KEY))
+        _execute_pipeline(
+            st.session_state.get(_OVERRIDES_KEY),
+            st.session_state.get(_ACTION_KEY),
+        )
 
     pipeline: PipelineResult | None = st.session_state.get(run_key)
     if pipeline is None:
@@ -245,13 +410,8 @@ def render() -> None:
     for agent_result in pipeline.agent_results:
         _render_agent_card(agent_result)
 
-    # ── Step 4: Overrides ─────────────────────────────────────────────────────
-    st.header("Step 4 — Review & Override")
-    st.caption(
-        "Saved overrides persist across re-runs. "
-        "Click **Re-run with overrides** (Step 2) after making changes."
-    )
-    _render_overrides(pipeline)
+    # ── Step 4: Structured Review ─────────────────────────────────────────────
+    _render_review_panel(pipeline)
 
     # ── Step 5: Downloads ─────────────────────────────────────────────────────
     st.header("Step 5 — Download Outputs")
