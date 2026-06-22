@@ -1,10 +1,23 @@
 """Analyse KPI formulas to determine source-column dependencies.
 
 For each formula in a configured KPI tab:
-- Extracts the aggregate function, referenced sheet, and column letter(s)
-- Resolves column letters to canonical source-column names using the source
-  column mapping produced by :mod:`source_analyzer`
+- Classifies the formula as SOURCE_BACKED, DERIVED, ROLLUP, or VALIDATION
+- For SOURCE_BACKED formulas: resolves cross-sheet column references to canonical
+  source-column names using the mapping produced by :mod:`source_analyzer`
+- For DERIVED / ROLLUP / VALIDATION formulas: traces intra-sheet cell references
+  back to SOURCE_BACKED cells and inherits their canonical columns automatically
 - Reports which source columns are used by ≥1 KPI and which are never referenced
+
+Formula types
+-------------
+SOURCE_BACKED  cross-sheet reference(s) pointing at the configured source tab
+               e.g. =SUMIFS(SQL_data!C:C, SQL_data!E:E, ...)
+DERIVED        arithmetic / logical combination of other KPI cells in the same sheet
+               e.g. =B6+C6-D6,  =IF(C15>0, C15-D15, 0)
+ROLLUP         aggregation of a same-sheet range
+               e.g. =SUM(B6:B9),  =AVERAGE(C6:C10)
+VALIDATION     cross-check / reconciliation formula referencing other KPI cells
+               e.g. =E8-F8,  =ABS(D15-E15)
 """
 
 from __future__ import annotations
@@ -12,6 +25,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 import pandas as pd
 
@@ -20,9 +34,21 @@ from src.schema_matching.normalizer import normalize_column_name
 
 logger = logging.getLogger(__name__)
 
-# Regex for cross-sheet formula references  SheetName!ColLetters[RowNum]
+# ── Regex patterns ────────────────────────────────────────────────────────────
+
+# Cross-sheet reference:  'SheetName'!$COL$ROW  or  SheetName!COL
 _SHEET_REF_RE = re.compile(
     r"'?([A-Za-z0-9_][\w\s]*?)'?\s*!\s*\$?([A-Z]+)\$?(\d*)"
+)
+
+# Intra-sheet cell reference after cross-sheet refs have been stripped:
+# matches COL_LETTERS + ROW_DIGITS, e.g. B6, $C$15, AA100
+# Requires a digit so bare function names (SUM, IF) don't match.
+_INTRASHEET_CELL_RE = re.compile(r"\$?([A-Z]{1,3})\$?(\d{1,7})")
+
+# Range separator inside a function arg, e.g. B6:B10
+_RANGE_RE = re.compile(
+    r"\$?([A-Z]{1,3})\$?(\d{1,7})\s*:\s*\$?([A-Z]{1,3})\$?(\d{1,7})"
 )
 
 _AGGREGATE_FUNCS = frozenset({
@@ -33,6 +59,12 @@ _AGGREGATE_FUNCS = frozenset({
     "VLOOKUP", "HLOOKUP", "INDEX", "MATCH",
 })
 
+_ROLLUP_FUNCS = frozenset({"SUM", "AVERAGE", "MAX", "MIN", "MEDIAN", "COUNT", "COUNTA"})
+
+FormulaType = Literal["SOURCE_BACKED", "DERIVED", "ROLLUP", "VALIDATION"]
+
+
+# ── Data models ───────────────────────────────────────────────────────────────
 
 @dataclass
 class KpiDependency:
@@ -46,10 +78,14 @@ class KpiDependency:
     aggregate_function: str
     # Raw (sheet_name, col_letter) tuples from the formula
     raw_refs: list[tuple[str, str]] = field(default_factory=list)
-    # Canonical source-column names resolved from raw_refs
+    # Canonical source-column names resolved from raw_refs (or inherited via tracing)
     canonical_source_columns: list[str] = field(default_factory=list)
     # True if every referenced sheet is the configured source tab for this workbook
     refs_source_tab_only: bool = True
+    # Formula classification
+    formula_type: FormulaType = "SOURCE_BACKED"
+    # Intra-sheet cells this formula was traced through (DERIVED / ROLLUP)
+    traced_from_cells: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -71,9 +107,11 @@ class KpiAnalysisResult:
                 "kpi_label":             dep.kpi_label,
                 "cell_address":          dep.cell_address,
                 "formula":               dep.formula,
+                "formula_type":          dep.formula_type,
                 "aggregate_function":    dep.aggregate_function,
                 "source_columns_used":   ", ".join(dep.canonical_source_columns),
                 "refs_source_tab_only":  dep.refs_source_tab_only,
+                "traced_from_cells":     ", ".join(dep.traced_from_cells),
                 "raw_refs":              " | ".join(
                     f"{s}!{c}" for s, c in dep.raw_refs
                 ),
@@ -81,8 +119,8 @@ class KpiAnalysisResult:
         if not rows:
             return pd.DataFrame(columns=[
                 "workbook_name", "kpi_tab", "kpi_label", "cell_address", "formula",
-                "aggregate_function", "source_columns_used", "refs_source_tab_only",
-                "raw_refs",
+                "formula_type", "aggregate_function", "source_columns_used",
+                "refs_source_tab_only", "traced_from_cells", "raw_refs",
             ])
         return pd.DataFrame(rows)
 
@@ -107,6 +145,8 @@ class KpiAnalysisResult:
         return pd.DataFrame(rows)
 
 
+# ── Column letter helpers ─────────────────────────────────────────────────────
+
 def _col_letter_to_index(letters: str) -> int:
     idx = 0
     for ch in letters.upper():
@@ -114,24 +154,170 @@ def _col_letter_to_index(letters: str) -> int:
     return idx - 1
 
 
+def _index_to_col_letter(idx: int) -> str:
+    """Convert 0-based column index to Excel column letter (A, B, …, AA, …)."""
+    result = ""
+    idx += 1
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        result = chr(rem + ord("A")) + result
+    return result
+
+
+# ── Formula classification ────────────────────────────────────────────────────
+
+def _classify_formula(formula: str, configured_source_tab: str) -> FormulaType:
+    """Determine the formula type based on its reference pattern."""
+    has_any_sheet_ref = bool(_SHEET_REF_RE.search(formula))
+
+    if has_any_sheet_ref:
+        # Check whether any cross-sheet ref points at the source tab
+        for m in _SHEET_REF_RE.finditer(formula):
+            sheet = m.group(1).strip()
+            if sheet == configured_source_tab:
+                return "SOURCE_BACKED"
+        # Has cross-sheet refs but none to the source tab — treat as DERIVED
+        # (e.g. references another KPI tab or an external lookup sheet)
+        return "DERIVED"
+
+    # No cross-sheet refs — pure intra-sheet formula
+    upper = formula.upper()
+    agg_match = re.match(r"=\s*([A-Z]+)\s*\(", upper)
+    if agg_match and agg_match.group(1) in _ROLLUP_FUNCS:
+        return "ROLLUP"
+
+    return "DERIVED"
+
+
+# ── Intra-sheet cell extraction ───────────────────────────────────────────────
+
+def _extract_intrasheet_cells(formula: str) -> list[str]:
+    """Return distinct same-sheet cell addresses referenced by *formula*.
+
+    Cross-sheet references are stripped first so only bare cell addresses
+    (B6, $C$15, etc.) are matched.  Range notation ``B6:B10`` is expanded
+    up to a maximum of 20 cells; wider ranges use just the endpoints.
+    """
+    # Strip cross-sheet references to avoid mis-matching their column letters
+    clean = _SHEET_REF_RE.sub(" ", formula)
+
+    cells: list[str] = []
+    seen: set[str] = set()
+
+    def _add(col: str, row: str) -> None:
+        addr = f"{col.upper()}{row}"
+        if addr not in seen:
+            seen.add(addr)
+            cells.append(addr)
+
+    # Expand ranges first
+    for m in _RANGE_RE.finditer(clean):
+        col_a, row_a, col_b, row_b = (
+            m.group(1).upper(), int(m.group(2)),
+            m.group(3).upper(), int(m.group(4)),
+        )
+        if col_a == col_b:
+            # Same-column range: expand rows (cap at 20)
+            r_min, r_max = min(row_a, row_b), max(row_a, row_b)
+            for r in range(r_min, min(r_max + 1, r_min + 20)):
+                _add(col_a, str(r))
+        elif row_a == row_b:
+            # Same-row range: expand columns (cap at 20)
+            c_min = _col_letter_to_index(col_a)
+            c_max = _col_letter_to_index(col_b)
+            for c in range(c_min, min(c_max + 1, c_min + 20)):
+                _add(_index_to_col_letter(c), str(row_a))
+        else:
+            _add(col_a, str(row_a))
+            _add(col_b, str(row_b))
+
+    # Remove range notation so individual cell re doesn't double-match
+    clean_no_ranges = _RANGE_RE.sub(" ", clean)
+
+    for m in _INTRASHEET_CELL_RE.finditer(clean_no_ranges):
+        col, row = m.group(1).upper(), m.group(2)
+        _add(col, row)
+
+    return cells
+
+
+# ── Lineage tracing for DERIVED / ROLLUP formulas ────────────────────────────
+
+def _trace_derived_lineage(
+    dependencies: list[KpiDependency],
+    workbook_name: str,
+    kpi_tab: str,
+) -> None:
+    """Propagate source columns from SOURCE_BACKED cells to DERIVED/ROLLUP cells.
+
+    Iterates until stable (handles chains like E6→B6→SUMIFS) with a cap of
+    10 rounds to guard against circular references.
+    """
+    # Build address → dependency map for cells in this workbook/tab
+    cell_map: dict[str, KpiDependency] = {
+        dep.cell_address: dep
+        for dep in dependencies
+        if dep.workbook_name == workbook_name and dep.kpi_tab == kpi_tab
+    }
+
+    changed = True
+    rounds = 0
+    while changed and rounds < 10:
+        changed = False
+        rounds += 1
+        for dep in dependencies:
+            if dep.workbook_name != workbook_name or dep.kpi_tab != kpi_tab:
+                continue
+            if dep.formula_type not in ("DERIVED", "ROLLUP", "VALIDATION"):
+                continue
+
+            referenced_cells = _extract_intrasheet_cells(dep.formula)
+            inherited: list[str] = list(dep.canonical_source_columns)
+            traced: list[str] = list(dep.traced_from_cells)
+
+            for cell_addr in referenced_cells:
+                ref_dep = cell_map.get(cell_addr)
+                if ref_dep is None:
+                    continue
+                for col in ref_dep.canonical_source_columns:
+                    if col not in inherited:
+                        inherited.append(col)
+                        changed = True
+                if cell_addr not in traced:
+                    traced.append(cell_addr)
+
+            dep.canonical_source_columns = inherited
+            dep.traced_from_cells = traced
+
+    if rounds > 1:
+        logger.debug(
+            "Lineage tracing for %s/%s completed in %d round(s)",
+            workbook_name, kpi_tab, rounds,
+        )
+
+
+# ── Main analysis function ────────────────────────────────────────────────────
+
 def analyze_kpi_dependencies(
     bundles: list,
     config: RationalizationConfig,
     source_column_mapping: dict[tuple[str, str, str], str],
 ) -> KpiAnalysisResult:
-    """Extract KPI formulas and resolve their source-column dependencies.
+    """Extract KPI formulas, classify them, and resolve source-column dependencies.
+
+    SOURCE_BACKED formulas are resolved directly from cross-sheet column refs.
+    DERIVED / ROLLUP / VALIDATION formulas have their source columns inherited
+    automatically by tracing intra-sheet cell references back to SOURCE_BACKED cells.
 
     Args:
-        bundles: All loaded :class:`~src.ingestion.loader.WorkbookBundle` objects.
+        bundles: All loaded WorkbookBundle objects.
         config: Rationalization configuration.
-        source_column_mapping: ``(workbook, source_tab, original_col)`` → canonical name,
-            produced by :func:`~source_analyzer.analyze_source_data`.
+        source_column_mapping: ``(workbook, source_tab, original_col)`` → canonical name.
 
     Returns:
-        :class:`KpiAnalysisResult` with dependency list and referenced-column sets.
+        KpiAnalysisResult with classified dependency list and referenced-column sets.
     """
-    # Build: workbook → source_tab → list of (col_letter_0_based, canonical_name)
-    # so we can resolve formula column letters to canonical names
+    # Build: (workbook, source_tab) → col_letter → canonical_name
     header_map: dict[tuple[str, str], dict[str, str]] = {}
     for bundle in bundles:
         wb_cfg = config.config_for(bundle.file_name)
@@ -167,7 +353,7 @@ def analyze_kpi_dependencies(
                 continue
 
             if raw_ws is not None:
-                # Extract from openpyxl worksheet (has formula strings)
+                tab_deps: list[KpiDependency] = []
                 for row in raw_ws.iter_rows():
                     for cell in row:
                         if not (isinstance(cell.value, str) and cell.value.startswith("=")):
@@ -183,9 +369,12 @@ def analyze_kpi_dependencies(
                             configured_source_tab=wb_cfg.source_tab,
                             header_map=header_map,
                         )
-                        dependencies.append(dep)
+                        tab_deps.append(dep)
+
+                # Trace DERIVED/ROLLUP lineage for this tab
+                _trace_derived_lineage(tab_deps, bundle.file_name, kpi_tab)
+                dependencies.extend(tab_deps)
             else:
-                # No formula metadata — log warning, no KPI dependencies extractable
                 logger.warning(
                     "No formula metadata for '%s/%s' — KPI dependency extraction skipped",
                     bundle.file_name, kpi_tab,
@@ -203,10 +392,16 @@ def analyze_kpi_dependencies(
     }
     unreferenced = all_source_canonicals - referenced
 
+    n_source  = sum(1 for d in dependencies if d.formula_type == "SOURCE_BACKED")
+    n_derived = sum(1 for d in dependencies if d.formula_type == "DERIVED")
+    n_rollup  = sum(1 for d in dependencies if d.formula_type == "ROLLUP")
+    n_valid   = sum(1 for d in dependencies if d.formula_type == "VALIDATION")
+
     logger.info(
-        "KPI analysis: %d KPI formula(s), %d source canonical(s) referenced, "
-        "%d unreferenced",
-        len(dependencies), len(referenced), len(unreferenced),
+        "KPI analysis: %d formula(s) [%d source-backed, %d derived, %d rollup, %d validation], "
+        "%d source canonical(s) referenced, %d unreferenced",
+        len(dependencies), n_source, n_derived, n_rollup, n_valid,
+        len(referenced), len(unreferenced),
     )
     return KpiAnalysisResult(
         dependencies=dependencies,
@@ -214,6 +409,8 @@ def analyze_kpi_dependencies(
         unreferenced_canonicals=unreferenced,
     )
 
+
+# ── Formula parser ────────────────────────────────────────────────────────────
 
 def _parse_formula_dependency(
     formula: str,
@@ -224,7 +421,8 @@ def _parse_formula_dependency(
     configured_source_tab: str,
     header_map: dict[tuple[str, str], dict[str, str]],
 ) -> KpiDependency:
-    agg_func = _detect_agg(formula)
+    formula_type = _classify_formula(formula, configured_source_tab)
+    agg_func     = _detect_agg(formula)
     raw_refs: list[tuple[str, str]] = []
     canonical_cols: list[str] = []
     refs_source_only = True
@@ -237,10 +435,17 @@ def _parse_formula_dependency(
         if sheet != configured_source_tab:
             refs_source_only = False
 
-        col_map = header_map.get((workbook_name, configured_source_tab), {})
-        canonical = col_map.get(col_letter)
-        if canonical and canonical not in canonical_cols:
-            canonical_cols.append(canonical)
+        if formula_type == "SOURCE_BACKED":
+            col_map = header_map.get((workbook_name, configured_source_tab), {})
+            canonical = col_map.get(col_letter)
+            if canonical and canonical not in canonical_cols:
+                canonical_cols.append(canonical)
+
+    # DERIVED / ROLLUP / VALIDATION: no cross-sheet source refs, so
+    # refs_source_tab_only is vacuously True but there are no raw_refs to
+    # the source tab — mark as False to distinguish from resolved SOURCE_BACKED.
+    if formula_type != "SOURCE_BACKED":
+        refs_source_only = True  # not cross-sheet at all, so not "wrong" tab
 
     return KpiDependency(
         workbook_name=workbook_name,
@@ -252,8 +457,11 @@ def _parse_formula_dependency(
         raw_refs=raw_refs,
         canonical_source_columns=canonical_cols,
         refs_source_tab_only=refs_source_only,
+        formula_type=formula_type,
     )
 
+
+# ── Auxiliary helpers ─────────────────────────────────────────────────────────
 
 def _detect_agg(formula: str) -> str:
     m = re.match(r"=\s*([A-Z]+)\s*\(", formula.upper())
@@ -272,16 +480,6 @@ def _find_label(raw_ws, row_idx: int, col_idx: int) -> str:
         if above.value and not (isinstance(above.value, str) and above.value.startswith("=")):
             return str(above.value).strip()
     return f"KPI_R{row_idx}C{col_idx}"
-
-
-def _index_to_col_letter(idx: int) -> str:
-    """Convert 0-based column index to Excel column letter (A, B, …, AA, …)."""
-    result = ""
-    idx += 1
-    while idx > 0:
-        idx, rem = divmod(idx - 1, 26)
-        result = chr(rem + ord("A")) + result
-    return result
 
 
 def _get_raw_ws(raw_wb, sheet_name: str):
