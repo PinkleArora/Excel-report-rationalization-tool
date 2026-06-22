@@ -113,9 +113,12 @@ def run(
         import traceback as _tb
         tb_str = _tb.format_exc()
         logger.exception("KpiAgent failed during analysis")
-        raise RuntimeError(
-            f"KpiAgent failed: {type(exc).__name__}: {exc}\n\n{tb_str}"
-        ) from exc
+        return AgentResult(
+            agent_name="KpiAgent",
+            decisions=[],
+            output=None,
+            warnings=[f"KPI analysis failed: {type(exc).__name__}: {exc}\n\n{tb_str}"],
+        )
 
     for dep in kpi_result.dependencies:
         conf = _kpi_confidence(dep)

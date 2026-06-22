@@ -93,11 +93,54 @@ def run(
             warnings=["No source frames found for validation."],
         )
 
+    # Detect duplicate canonical column names in master_df (same canonical appears ≥2 times)
+    master_col_counts: dict[str, int] = {}
+    for c in master_df.columns:
+        master_col_counts[c] = master_col_counts.get(c, 0) + 1
+    duplicate_canonicals = sorted(k for k, v in master_col_counts.items() if v > 1)
+    if duplicate_canonicals:
+        dup_msg = (
+            f"{len(duplicate_canonicals)} duplicate canonical column(s) found in "
+            f"Master Source Data: {', '.join(duplicate_canonicals[:10])}"
+            + (" …" if len(duplicate_canonicals) > 10 else "")
+            + ". Reconciliation will use the first occurrence of each."
+        )
+        warnings.append(dup_msg)
+        logger.warning(dup_msg)
+
+    # Also detect duplicates in source frames
+    for bundle in bundles:
+        wb_cfg = config.config_for(bundle.file_name)
+        if wb_cfg is None:
+            continue
+        sf = bundle.sheets.get(wb_cfg.source_tab)
+        if sf is None:
+            continue
+        from src.schema_matching.normalizer import normalize_column_name as _norm
+        norm_counts: dict[str, int] = {}
+        for c in sf.columns:
+            n = _norm(str(c))
+            norm_counts[n] = norm_counts.get(n, 0) + 1
+        src_dups = sorted(k for k, v in norm_counts.items() if v > 1)
+        if src_dups:
+            warnings.append(
+                f"Duplicate canonical column(s) in source tab "
+                f"'{bundle.file_name}/{wb_cfg.source_tab}': "
+                f"{', '.join(src_dups[:10])}"
+                + (" …" if len(src_dups) > 10 else "")
+            )
+
+    def _safe_is_numeric(col: str) -> bool:
+        """Check if a column in master_df has any numeric values; safe for duplicates."""
+        raw = master_df[col]
+        if isinstance(raw, pd.DataFrame):
+            raw = raw.iloc[:, 0]
+        return bool(pd.to_numeric(raw, errors="coerce").notna().any())
+
     # Columns to reconcile: KPI-referenced canonicals that are numeric
     numeric_cols = [
         c for c in kpi_result.referenced_canonicals
-        if c in master_df.columns
-        and pd.to_numeric(master_df[c], errors="coerce").notna().any()
+        if c in master_df.columns and _safe_is_numeric(c)
     ]
 
     if not numeric_cols:

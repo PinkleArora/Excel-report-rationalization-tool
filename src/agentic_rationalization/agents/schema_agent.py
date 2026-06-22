@@ -132,9 +132,12 @@ def run(
         import traceback as _tb
         tb_str = _tb.format_exc()
         logger.exception("SchemaAgent failed during source analysis")
-        raise RuntimeError(
-            f"SchemaAgent failed: {type(exc).__name__}: {exc}\n\n{tb_str}"
-        ) from exc
+        return AgentResult(
+            agent_name="SchemaAgent",
+            decisions=[],
+            output=None,
+            warnings=[f"Schema analysis failed: {type(exc).__name__}: {exc}\n\n{tb_str}"],
+        )
 
     # Build KPI-veto set: canonical names where two SIMILAR columns are each
     # used by a different KPI formula → never collapse them

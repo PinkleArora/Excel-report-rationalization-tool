@@ -61,21 +61,46 @@ def reconcile(
     )
 
     results: list[ReconciliationResult] = []
+    skipped_duplicates: list[str] = []
 
     for col in numeric_columns:
         # Sum across all source frames (normalise source column names on the fly)
         source_total = 0.0
+        col_has_duplicates = False
         for sf in source_frames:
             norm_map = {c: normalize_column_name(str(c)) for c in sf.columns}
             renamed = sf.rename(columns=norm_map)
-            if col in renamed.columns:
-                numeric_series = pd.to_numeric(renamed[col], errors="coerce")
-                source_total += float(numeric_series.sum(skipna=True))
+            if col not in renamed.columns:
+                continue
+            raw = renamed[col]
+            if isinstance(raw, pd.DataFrame):
+                # Duplicate canonical names — multiple source columns normalise to the
+                # same canonical.  Sum only the first occurrence and warn.
+                col_has_duplicates = True
+                logger.warning(
+                    "Duplicate canonical column '%s' in source frame — "
+                    "%d occurrences; using first for reconciliation.",
+                    col, raw.shape[1],
+                )
+                raw = raw.iloc[:, 0]
+            numeric_series = pd.to_numeric(raw, errors="coerce")
+            source_total += float(numeric_series.sum(skipna=True))
+
+        if col_has_duplicates and col not in skipped_duplicates:
+            skipped_duplicates.append(col)
 
         # Sum from consolidated output
         output_total = 0.0
         if col in output_data.columns:
-            numeric_series = pd.to_numeric(output_data[col], errors="coerce")
+            raw_out = output_data[col]
+            if isinstance(raw_out, pd.DataFrame):
+                logger.warning(
+                    "Duplicate canonical column '%s' in master output — "
+                    "using first occurrence for reconciliation.",
+                    col,
+                )
+                raw_out = raw_out.iloc[:, 0]
+            numeric_series = pd.to_numeric(raw_out, errors="coerce")
             output_total = float(numeric_series.sum(skipna=True))
 
         delta = output_total - source_total
