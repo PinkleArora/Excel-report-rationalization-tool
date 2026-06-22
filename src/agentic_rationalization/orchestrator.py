@@ -57,7 +57,7 @@ def run_pipeline(
     force_exclude:  set[str]       = set()
 
     for subject, action_key in (action_overrides or {}).items():
-        if action_key in ("MERGE",):
+        if action_key in ("MERGE", "MERGE_ANYWAY"):
             # subject looks like "Column 'canonical_a' (N workbook(s))"
             canonical_a = _extract_canonical_from_subject(subject)
             if canonical_a:
@@ -124,15 +124,14 @@ def run_pipeline(
     master_df: pd.DataFrame | None = None
     if fs_bytes:
         try:
-            from openpyxl import load_workbook
-            wb_check = load_workbook(io.BytesIO(fs_bytes), data_only=True)
             master_tab = config.future_source_tab_name
-            if master_tab in wb_check.sheetnames:
-                ws = wb_check[master_tab]
-                rows = ws.values
-                headers = next(rows, None)
-                if headers:
-                    master_df = pd.DataFrame(rows, columns=headers)
+            # _write_df_to_sheet writes a title at row 1 and headers at row 2;
+            # use header=1 (0-indexed) to skip the title row.
+            master_df = pd.read_excel(
+                io.BytesIO(fs_bytes),
+                sheet_name=master_tab,
+                header=1,
+            )
         except Exception as exc:
             logger.warning("Could not extract master DataFrame for validation: %s", exc)
 

@@ -53,7 +53,7 @@ def run(
             "for the consolidated source data worksheet."
         ),
         signals={"tab_name": config.future_source_tab_name},
-        overridable=True,
+        overridable=False,
     ))
 
     # Document KPI output tab name decisions
@@ -76,6 +76,7 @@ def run(
                     "output_tab_name":  output_name,
                     "user_defined":     has_explicit,
                 },
+                overridable=False,
             ))
 
     # Call the existing builder

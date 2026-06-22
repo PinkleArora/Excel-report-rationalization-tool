@@ -31,6 +31,13 @@ SIMILAR_COLUMN_ACTIONS: list[tuple[str, str]] = [
     ("EXCLUDE_B",   "Exclude column B from Master Source Data"),
 ]
 
+SIMILAR_COLUMN_ACTIONS_VETOED: list[tuple[str, str]] = [
+    ("ACCEPT",       "Accept — keep separate (KPI-usage veto applied)"),
+    ("MERGE_ANYWAY", "Merge anyway — override KPI-usage veto (advanced)"),
+    ("EXCLUDE_A",    "Exclude column A from Master Source Data"),
+    ("EXCLUDE_B",    "Exclude column B from Master Source Data"),
+]
+
 KPI_UNRESOLVED_ACTIONS: list[tuple[str, str]] = [
     ("ACCEPT",        "Accept as-is — agent will note unresolved dependency"),
     ("SKIP",          "Skip — do not include this formula in dependency mapping"),
@@ -116,9 +123,6 @@ def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDe
             signals = d.signals
             if signals.get("match_class") != "similar":
                 continue
-            # Only surface decisions that are genuinely uncertain (< 0.90)
-            if d.confidence >= 0.90:
-                continue
 
             canonical_a = signals.get("canonical_name") or _extract_canonical(d.subject)
             similar_to: list[str] = signals.get("similar_to", [])
@@ -150,10 +154,15 @@ def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDe
                     "KPI formulas, so the agent kept them separate."
                 )
 
-            # Build dynamic action list — if no canonical_b, can't exclude B
-            actions = list(SIMILAR_COLUMN_ACTIONS)
-            if not canonical_b:
-                actions = [(k, l) for k, l in actions if k != "EXCLUDE_B"]
+            # Build dynamic action list based on kpi_veto_applied
+            if signals.get("kpi_veto_applied"):
+                actions = list(SIMILAR_COLUMN_ACTIONS_VETOED)
+                if not canonical_b:
+                    actions = [(k, l) for k, l in actions if k != "EXCLUDE_B"]
+            else:
+                actions = list(SIMILAR_COLUMN_ACTIONS)
+                if not canonical_b:
+                    actions = [(k, l) for k, l in actions if k != "EXCLUDE_B"]
 
             actionable.append(ActionableDecision(
                 action_type="SIMILAR_COLUMN",
@@ -241,7 +250,7 @@ def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDe
         for d in consol_result.decisions:
             if not d.overridable:
                 continue
-            if not d.subject.startswith("Pair:"):
+            if not d.subject.startswith("Pair:") and not d.decision == "MANUAL_REVIEW":
                 continue
             if d.confidence >= 0.80:
                 continue

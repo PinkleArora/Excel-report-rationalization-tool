@@ -17,6 +17,7 @@ from src.agentic_rationalization.review_panel import (
     ActionableDecision,
     classify_actionable_decisions,
     SIMILAR_COLUMN_ACTIONS,
+    SIMILAR_COLUMN_ACTIONS_VETOED,
     KPI_UNRESOLVED_ACTIONS,
     CONSOLIDATION_ACTIONS,
 )
@@ -272,6 +273,135 @@ def _render_consolidation_card(ad: ActionableDecision, idx: int) -> None:
             st.session_state[_OVERRIDES_KEY].setdefault(ad.agent_name, {})[ad.subject] = chosen_key
 
 
+# ── Validation summary ───────────────────────────────────────────────────────
+
+def _render_validation_summary(pipeline: PipelineResult) -> None:
+    """Structured validation results card showing KPI reconciliation status."""
+    val_result = pipeline.get_result("ValidationAgent")
+    if val_result is None:
+        return
+    if not val_result.decisions:
+        if val_result.warnings:
+            st.info(f"Validation: {val_result.warnings[0]}")
+        return
+
+    overall = next((d for d in val_result.decisions if d.subject == "Overall validation"), None)
+    if overall is None:
+        return
+
+    sig = overall.signals
+    total  = sig.get("total_columns", 0)
+    passed = sig.get("pass_count", 0)
+    warned = sig.get("warn_count", 0)
+    failed = sig.get("fail_count", 0)
+
+    expanded = failed > 0
+    with st.expander("Validation — KPI Column Reconciliation", expanded=expanded):
+        if total == 0:
+            st.info("No numeric KPI-referenced columns were found to reconcile.")
+            if val_result.warnings:
+                for w in val_result.warnings:
+                    st.warning(w)
+            return
+
+        if failed == 0 and warned == 0:
+            st.success(
+                f"All {total} KPI column(s) reconciled — source totals match "
+                "Master Source Data within tolerance."
+            )
+        elif failed > 0:
+            st.error(
+                f"{failed} of {total} column(s) FAILED reconciliation. "
+                "Source totals do not match Master Source Data."
+            )
+        else:
+            st.warning(f"{warned} of {total} column(s) have reconciliation warnings.")
+
+        cp, cw, cf = st.columns(3)
+        cp.metric("✅ Pass", passed)
+        cw.metric("⚠️ Warn", warned)
+        cf.metric("❌ Fail", failed)
+
+        detail_rows = []
+        for d in val_result.decisions:
+            if d.subject == "Overall validation":
+                continue
+            s = d.signals
+            detail_rows.append({
+                "Status":      d.decision,
+                "Column":      d.subject.replace("Reconciliation: '", "").rstrip("'"),
+                "Source Total": f"{s.get('source_total', 0):,.2f}",
+                "Master Total": f"{s.get('master_total', 0):,.2f}",
+                "Delta":       f"{s.get('delta', 0):+,.2f}",
+                "Variance %":  f"{s.get('delta_pct', 0):.4f}%",
+                "Tolerance":   f"{s.get('tolerance_pct', 0):.2f}%",
+            })
+        if detail_rows:
+            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+        if val_result.warnings:
+            for w in val_result.warnings:
+                st.warning(w)
+
+
+def _render_validation_summary(pipeline: PipelineResult) -> None:
+    """Show a structured validation results card if validation ran."""
+    val_result = pipeline.get_result("ValidationAgent")
+    if val_result is None:
+        return
+    if not val_result.decisions:
+        if val_result.warnings:
+            st.info(f"Validation: {val_result.warnings[0]}")
+        return
+
+    # Find overall summary decision
+    overall = next((d for d in val_result.decisions if d.subject == "Overall validation"), None)
+    if overall is None:
+        return
+
+    sig = overall.signals
+    total = sig.get("total_columns", 0)
+    passed = sig.get("pass_count", 0)
+    warned = sig.get("warn_count", 0)
+    failed = sig.get("fail_count", 0)
+
+    with st.expander("✅ Validation Summary — KPI Column Reconciliation", expanded=(failed > 0)):
+        if failed == 0 and warned == 0:
+            st.success(f"All {total} KPI column(s) reconciled successfully (totals match within tolerance).")
+        elif failed > 0:
+            st.error(f"{failed} column(s) FAILED reconciliation — source totals do not match Master Source Data.")
+        else:
+            st.warning(f"{warned} column(s) have reconciliation warnings.")
+
+        col_p, col_w, col_f = st.columns(3)
+        col_p.metric("✅ Pass", passed)
+        col_w.metric("⚠️ Warn", warned)
+        col_f.metric("❌ Fail", failed)
+
+        # Build per-column table from remaining decisions
+        detail_rows = []
+        for d in val_result.decisions:
+            if d.subject == "Overall validation":
+                continue
+            sig_d = d.signals
+            detail_rows.append({
+                "Status": d.decision,
+                "Column": d.subject.replace("Reconciliation: '", "").rstrip("'"),
+                "Source Total": f"{sig_d.get('source_total', 0):,.2f}",
+                "Master Total": f"{sig_d.get('master_total', 0):,.2f}",
+                "Delta": f"{sig_d.get('delta', 0):+,.2f}",
+                "Variance %": f"{sig_d.get('delta_pct', 0):.4f}%",
+                "Tolerance": f"{sig_d.get('tolerance_pct', 0):.2f}%",
+            })
+        if detail_rows:
+            df_val = pd.DataFrame(detail_rows)
+            st.dataframe(df_val, use_container_width=True, hide_index=True)
+
+        if val_result.warnings:
+            for w in val_result.warnings:
+                st.warning(w)
+
+
 # ── Main review panel ─────────────────────────────────────────────────────────
 
 def _render_review_panel(pipeline: PipelineResult) -> None:
@@ -335,8 +465,9 @@ def _render_review_panel(pipeline: PipelineResult) -> None:
     if n_con:
         with next(tab_iter):
             st.caption(
-                "These workbook pairs have low schema overlap. "
-                "Decide whether to consolidate them or keep them separate."
+                "These workbooks have low schema overlap or grain compatibility issues. "
+                "The agent recommends manual review. "
+                "For each pair, choose whether to consolidate into Master Source Data or keep separate."
             )
             con_items = [a for a in actionable if a.action_type == "CONSOLIDATION_PAIR"]
             for i, ad in enumerate(con_items):
@@ -438,8 +569,50 @@ def render() -> None:
     c4.metric("🔴 Low Confidence", low)
     c5.metric("⚠️ Warnings", total_warnings)
 
+    # Decision Explorer — filter decisions by confidence level
+    with st.expander("🔍 Decision Explorer", expanded=False):
+        conf_tab_all, conf_tab_high, conf_tab_med, conf_tab_low, conf_tab_warn = st.tabs([
+            "All",
+            f"🟢 High ({high})",
+            f"🟡 Medium ({med})",
+            f"🔴 Low ({low})",
+            f"⚠️ Warnings ({total_warnings})",
+        ])
+
+        all_rows = []
+        for ar in pipeline.agent_results:
+            for d in ar.decisions:
+                all_rows.append({
+                    "Agent":      ar.agent_name,
+                    "":           _conf_color(d.confidence),
+                    "Subject":    d.subject[:80],
+                    "Decision":   d.decision[:60],
+                    "Confidence": f"{d.confidence:.0%}",
+                    "Overridable": "Yes" if d.overridable else "No",
+                    "Reasoning":  d.reasoning[:120],
+                })
+
+        df_all  = pd.DataFrame(all_rows)
+        with conf_tab_all:
+            st.dataframe(df_all, use_container_width=True, hide_index=True)
+        with conf_tab_high:
+            df_h = df_all[df_all["Confidence"].apply(lambda x: float(x.rstrip("%")) >= 90)]
+            st.dataframe(df_h, use_container_width=True, hide_index=True) if not df_h.empty else st.info("No high-confidence decisions.")
+        with conf_tab_med:
+            df_m = df_all[df_all["Confidence"].apply(lambda x: 70 <= float(x.rstrip("%")) < 90)]
+            st.dataframe(df_m, use_container_width=True, hide_index=True) if not df_m.empty else st.info("No medium-confidence decisions.")
+        with conf_tab_low:
+            df_l = df_all[df_all["Confidence"].apply(lambda x: float(x.rstrip("%")) < 70)]
+            st.dataframe(df_l, use_container_width=True, hide_index=True) if not df_l.empty else st.info("No low-confidence decisions.")
+        with conf_tab_warn:
+            warn_agents = {ar.agent_name for ar in pipeline.agent_results if ar.warnings}
+            df_w = df_all[df_all["Agent"].isin(warn_agents)]
+            st.dataframe(df_w, use_container_width=True, hide_index=True) if not df_w.empty else st.info("No warnings.")
+
     for agent_result in pipeline.agent_results:
         _render_agent_card(agent_result)
+
+    _render_validation_summary(pipeline)
 
     # ── Step 4: Structured Review ─────────────────────────────────────────────
     _render_review_panel(pipeline)
