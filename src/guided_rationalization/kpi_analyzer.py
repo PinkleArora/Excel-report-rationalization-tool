@@ -432,20 +432,21 @@ def _parse_formula_dependency(
         col_letter = m.group(2).upper()
         raw_refs.append((sheet, col_letter))
 
-        if sheet != configured_source_tab:
+        # A self-reference (formula on kpi_tab referencing kpi_tab, e.g.
+        # Summary!$A6 used as a SUMIFS filter criterion) is NOT an external
+        # dependency — it must not lower refs_source_only.
+        if sheet != configured_source_tab and sheet != kpi_tab:
             refs_source_only = False
 
-        if formula_type == "SOURCE_BACKED":
+        if formula_type == "SOURCE_BACKED" and sheet == configured_source_tab:
             col_map = header_map.get((workbook_name, configured_source_tab), {})
             canonical = col_map.get(col_letter)
             if canonical and canonical not in canonical_cols:
                 canonical_cols.append(canonical)
 
-    # DERIVED / ROLLUP / VALIDATION: no cross-sheet source refs, so
-    # refs_source_tab_only is vacuously True but there are no raw_refs to
-    # the source tab — mark as False to distinguish from resolved SOURCE_BACKED.
+    # DERIVED / ROLLUP / VALIDATION: no cross-sheet source refs — vacuously fine.
     if formula_type != "SOURCE_BACKED":
-        refs_source_only = True  # not cross-sheet at all, so not "wrong" tab
+        refs_source_only = True
 
     return KpiDependency(
         workbook_name=workbook_name,

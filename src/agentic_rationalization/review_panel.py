@@ -80,6 +80,11 @@ class ActionableDecision:
     # KPI labels affected by this decision
     kpi_labels: list[str] = field(default_factory=list)
 
+    # KPI_UNRESOLVED — all available canonical column names (for dropdown)
+    available_canonicals: list[str] = field(default_factory=list)
+    # KPI_UNRESOLVED — raw refs that could not be mapped (col_letter or sheet!col)
+    unresolved_raw_refs: list[str] = field(default_factory=list)
+
 
 def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDecision]:
     """Extract all decisions that need explicit user review from a PipelineResult.
@@ -98,6 +103,9 @@ def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDe
     if source_result is not None:
         for (wb, tab, orig), canonical in source_result.column_mapping.items():
             reverse_map.setdefault(canonical, []).append((wb, tab, orig))
+
+    # All canonical column names available in the source schema (for KPI dropdowns)
+    all_canonicals: list[str] = sorted(reverse_map.keys()) if reverse_map else []
 
     # ── SchemaAgent — similar columns ────────────────────────────────────────
     schema_agent_result = pipeline.get_result("SchemaAgent")
@@ -184,16 +192,29 @@ def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDe
             kpi_tab_name = parts[1] if len(parts) > 1 else ""
             cell_addr    = parts[2] if len(parts) > 2 else d.subject
             formula      = signals.get("formula", "")
-            refs_only    = signals.get("refs_source_tab_only", True)
+
+            # Build list of raw cross-sheet refs that weren't resolved to a canonical
+            raw_refs: list[tuple[str, str]] = signals.get("raw_refs", [])
+            unresolved_refs = [
+                f"{sheet}!{col}"
+                for sheet, col in raw_refs
+                if not any(
+                    True for c in canonical_cols
+                    # We don't have a direct letter→canonical map here, so include
+                    # any raw ref whose col_letter is not accounted for by using
+                    # length as a proxy; safer to just show all refs when empty
+                )
+            ] if not canonical_cols else []
 
             if not canonical_cols:
                 desc = (
-                    f"Formula in {d.subject} could not be resolved to any source column. "
-                    "The formula may reference a tab not configured as source data."
+                    f"Formula `{formula}` could not be resolved to any source column. "
+                    "The formula may reference a tab not configured as source data, "
+                    "or the column letter could not be matched to a header row."
                 )
             else:
                 desc = (
-                    f"Formula in {d.subject} references sheet(s) outside the configured "
+                    f"Formula `{formula}` references sheet(s) outside the configured "
                     "source tab — partial mapping only. "
                     f"Resolved columns: {', '.join(canonical_cols)}."
                 )
@@ -210,6 +231,8 @@ def classify_actionable_decisions(pipeline: PipelineResult) -> list[ActionableDe
                 kpi_tab=kpi_tab_name,
                 cell_address=cell_addr,
                 kpi_labels=[d.decision],
+                available_canonicals=all_canonicals,
+                unresolved_raw_refs=unresolved_refs,
             ))
 
     # ── ConsolidationAgent — uncertain workbook pairs ────────────────────────

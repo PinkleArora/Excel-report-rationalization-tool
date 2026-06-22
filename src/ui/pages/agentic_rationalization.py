@@ -160,6 +160,8 @@ def _render_kpi_unresolved_card(ad: ActionableDecision, idx: int) -> None:
             st.caption(ad.description)
             if ad.formula:
                 st.code(ad.formula, language=None)
+            if ad.kpi_labels:
+                st.caption(f"KPI label: **{ad.kpi_labels[0]}**")
         with c2:
             st.markdown("**Confidence:**")
             st.error(f"{ad.confidence:.0%}")
@@ -178,21 +180,49 @@ def _render_kpi_unresolved_card(ad: ActionableDecision, idx: int) -> None:
         )
         chosen_key = next(k for k, l in ad.available_actions if l == chosen_label)
 
-        manual_col = ""
+        # Dropdown replaces free-text: user picks from all known canonical names
+        selected_col = ""
         if chosen_key == "MANUAL_COLUMN":
-            saved_manual = st.session_state.get(_OVERRIDES_KEY, {}).get(ad.agent_name, {}).get(ad.subject, "")
-            manual_col = st.text_input(
-                "Source column name (canonical or original):",
-                value=saved_manual if saved_manual not in ("SKIP", "ACCEPT") else "",
-                key=_widget_key("kpi_manual", ad.subject),
-                placeholder="e.g. statutory_reserves_total",
+            saved_manual = (
+                st.session_state.get(_OVERRIDES_KEY, {})
+                .get(ad.agent_name, {})
+                .get(ad.subject, "")
             )
+            canonicals = ad.available_canonicals or []
+            if canonicals:
+                # Determine default selection
+                default_col = saved_manual if saved_manual in canonicals else (
+                    canonicals[0] if canonicals else ""
+                )
+                default_col_idx = canonicals.index(default_col) if default_col in canonicals else 0
+                st.markdown("**Select source column:**")
+                st.caption(
+                    "Choose the canonical source column this formula should map to. "
+                    "Column names shown are the normalised names used in Master Source Data."
+                )
+                selected_col = st.selectbox(
+                    "Source column:",
+                    options=canonicals,
+                    index=default_col_idx,
+                    key=_widget_key("kpi_col", ad.subject),
+                )
+            else:
+                # Fallback: no schema available yet — show text input
+                selected_col = st.text_input(
+                    "Source column name:",
+                    value=saved_manual if saved_manual not in ("SKIP", "ACCEPT") else "",
+                    key=_widget_key("kpi_manual", ad.subject),
+                    placeholder="e.g. statutory_reserves_total",
+                )
 
         if _ACTION_KEY not in st.session_state:
             st.session_state[_ACTION_KEY] = {}
         st.session_state[_ACTION_KEY][ad.subject] = chosen_key
         if chosen_key != "ACCEPT":
-            annotation = manual_col if chosen_key == "MANUAL_COLUMN" and manual_col else chosen_key
+            annotation = (
+                selected_col if chosen_key == "MANUAL_COLUMN" and selected_col
+                else chosen_key
+            )
             if _OVERRIDES_KEY not in st.session_state:
                 st.session_state[_OVERRIDES_KEY] = {}
             st.session_state[_OVERRIDES_KEY].setdefault(ad.agent_name, {})[ad.subject] = annotation
@@ -294,8 +324,9 @@ def _render_review_panel(pipeline: PipelineResult) -> None:
     if n_kpi:
         with next(tab_iter):
             st.caption(
-                "These KPI formulas could not be resolved to source columns. "
-                "You can skip them or specify the source column manually."
+                "These source-backed KPI formulas could not be automatically resolved "
+                "to a source column. Select the correct source column from the dropdown, "
+                "or skip to exclude the formula from dependency mapping."
             )
             kpi_items = [a for a in actionable if a.action_type == "KPI_UNRESOLVED"]
             for i, ad in enumerate(kpi_items):
