@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import traceback
 import zipfile
 from datetime import datetime
 from itertools import groupby
@@ -520,7 +521,11 @@ def render() -> None:
             try:
                 bundles = [load_workbook_from_bytes(f.read(), file_name=f.name) for f in uploaded]
             except Exception as exc:
-                st.error(f"Failed to load workbooks: {exc}")
+                tb = traceback.format_exc()
+                import logging
+                logging.getLogger(__name__).error("Failed to load workbooks:\n%s", tb)
+                st.error(f"**Failed to load workbooks:** `{type(exc).__name__}: {exc}`")
+                st.code(tb, language="python")
                 return
         with st.spinner("Running agentic pipeline (this may take a moment)…"):
             try:
@@ -533,7 +538,11 @@ def render() -> None:
                 st.session_state[run_key] = result
                 st.session_state["agentic_bundles"] = bundles
             except Exception as exc:
-                st.error(f"Pipeline error: {exc}")
+                tb = traceback.format_exc()
+                import logging
+                logging.getLogger(__name__).error("Pipeline error:\n%s", tb)
+                st.error(f"**Pipeline error:** `{type(exc).__name__}: {exc}`")
+                st.code(tb, language="python")
 
     if run_clicked:
         st.session_state.pop(_OVERRIDES_KEY, None)

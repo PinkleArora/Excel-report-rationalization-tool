@@ -117,8 +117,14 @@ def run(
         ))
         logger.warning("GenerationAgent blocked: %s", msg)
     except Exception as exc:
-        warnings.append(f"Generation failed: {exc}")
+        import traceback as _tb
+        tb_str = _tb.format_exc()
         logger.exception("GenerationAgent failed")
+        # Store full traceback in warnings so it appears in the agent card
+        warnings.append(
+            f"Generation failed: {type(exc).__name__}: {exc}\n\n{tb_str}"
+        )
+        raise  # re-raise so the UI also captures and displays the full traceback
 
     return AgentResult(
         agent_name="GenerationAgent",

@@ -132,8 +132,8 @@ def run_pipeline(
                 sheet_name=master_tab,
                 header=1,
             )
-        except Exception as exc:
-            logger.warning("Could not extract master DataFrame for validation: %s", exc)
+        except Exception:
+            logger.exception("Could not extract master DataFrame for validation")
 
     val_result = validation_agent.run(bundles, config, kpi_analysis, master_df, tolerance=tolerance)
     _apply_overrides(val_result, _overrides)

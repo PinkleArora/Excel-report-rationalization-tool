@@ -110,13 +110,12 @@ def run(
             bundles, config, source_result_pass1.column_mapping
         )
     except Exception as exc:
+        import traceback as _tb
+        tb_str = _tb.format_exc()
         logger.exception("KpiAgent failed during analysis")
-        return AgentResult(
-            agent_name="KpiAgent",
-            decisions=[],
-            output=None,
-            warnings=[f"KPI analysis failed: {exc}"],
-        )
+        raise RuntimeError(
+            f"KpiAgent failed: {type(exc).__name__}: {exc}\n\n{tb_str}"
+        ) from exc
 
     for dep in kpi_result.dependencies:
         conf = _kpi_confidence(dep)
