@@ -26,8 +26,15 @@ import itertools
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from typing import Optional
 
 import pandas as pd
+
+try:
+    from rapidfuzz import fuzz as _fuzz
+    _RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    _RAPIDFUZZ_AVAILABLE = False
 
 from src.guided_rationalization.config import RationalizationConfig
 from src.guided_rationalization.kpi_analyzer import KpiAnalysisResult
@@ -68,6 +75,16 @@ class FileProfile:
 
 
 @dataclass
+class FileContribution:
+    file_name: str
+    total_columns: int
+    kpi_columns: int
+    common_columns_contributed: int
+    unique_columns_contributed: int
+    discardable_columns: int
+
+
+@dataclass
 class ConsolidationGroup:
     group_id: int
     group_label: str
@@ -80,6 +97,8 @@ class ConsolidationGroup:
     recommendation: str
     expected_master_columns: int
     reasoning: str
+    incompatibility_detail: str = ""
+    file_contributions: list = field(default_factory=list)  # list[FileContribution]
 
 
 @dataclass
@@ -111,6 +130,16 @@ class FinalRecommendation:
 
 
 @dataclass
+class KpiAlignment:
+    canonical_kpi: str
+    kpi_labels: list[str]
+    per_file_match: dict  # file_name → matched raw column name ("" = not found)
+    per_file_confidence: dict  # file_name → confidence (1.0 = exact, <1.0 = fuzzy)
+    status: str  # "aligned" | "partial" | "missing"
+    suggestion: str
+
+
+@dataclass
 class ConsolidationIntelligenceResult:
     file_profiles: list[FileProfile]
     pairwise_scores: list[CompatibilityScore]
@@ -118,6 +147,7 @@ class ConsolidationIntelligenceResult:
     discard_analysis: DiscardAnalysis
     final_recommendation: FinalRecommendation
     visual_map: str
+    kpi_alignments: list = field(default_factory=list)  # list[KpiAlignment]
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +209,7 @@ def _build_groups(
     grain_map: dict[str, GrainDetectionResult],
     col_map: dict[str, list[str]],
     kpi_analysis,
+    kpi_referenced: set | None = None,
 ) -> list[ConsolidationGroup]:
     parent = _build_union_find(files)
 
@@ -191,24 +222,30 @@ def _build_groups(
         root = _find(parent, f)
         clusters.setdefault(root, []).append(f)
 
-    kpi_referenced: set[str] = set()
-    if kpi_analysis is not None:
-        kpi_referenced = getattr(kpi_analysis, "referenced_canonicals", set())
+    _kpi_referenced: set[str] = kpi_referenced or set()
+    if not _kpi_referenced and kpi_analysis is not None:
+        _kpi_referenced = getattr(kpi_analysis, "referenced_canonicals", set())
+
+    # Build lookup for pairwise scores
+    pair_score_map: dict[tuple[str, str], CompatibilityScore] = {}
+    for sc in pairwise:
+        pair_score_map[(sc.file_a, sc.file_b)] = sc
+        pair_score_map[(sc.file_b, sc.file_a)] = sc
 
     groups: list[ConsolidationGroup] = []
     for group_id, (root, members) in enumerate(sorted(clusters.items()), start=1):
-        all_cols: list[set[str]] = []
+        normed_by_file: dict[str, set[str]] = {}
         for fname in members:
-            normed = {normalize_column_name(c) for c in col_map.get(fname, [])}
-            all_cols.append(normed)
+            normed_by_file[fname] = {normalize_column_name(c) for c in col_map.get(fname, [])}
 
-        union_cols: set[str] = set().union(*all_cols) if all_cols else set()
-        common_cols: set[str] = all_cols[0].copy() if all_cols else set()
-        for s in all_cols[1:]:
+        all_cols_list = list(normed_by_file.values())
+        union_cols: set[str] = set().union(*all_cols_list) if all_cols_list else set()
+        common_cols: set[str] = all_cols_list[0].copy() if all_cols_list else set()
+        for s in all_cols_list[1:]:
             common_cols &= s
 
-        kpi_required = len(union_cols & kpi_referenced)
-        discardable = len(union_cols - kpi_referenced - common_cols)
+        kpi_required = len(union_cols & _kpi_referenced)
+        discardable = len(union_cols - _kpi_referenced - common_cols)
 
         grain_cat = grain_map[root].grain_category if root in grain_map else "unknown"
         grain_counts = Counter(grain_map[f].grain_category for f in members if f in grain_map)
@@ -223,6 +260,58 @@ def _build_groups(
             f"KPI-required: {kpi_required}, discardable: {discardable}."
         )
 
+        # Incompatibility detail for standalone files
+        incompatibility_detail = ""
+        if len(members) == 1 and files:
+            fname = members[0]
+            grain_info = grain_map.get(fname)
+            grain_label = grain_info.grain_label if grain_info else "Unknown"
+            reasons = []
+            for other in files:
+                if other == fname:
+                    continue
+                sc = pair_score_map.get((fname, other))
+                if sc is None:
+                    continue
+                if not sc.grain_compatible:
+                    other_grain = grain_map.get(other)
+                    other_label = other_grain.grain_label if other_grain else sc.grain_b
+                    reasons.append(
+                        f"• **Grain mismatch with `{other}`**: this file is *{grain_label}* "
+                        f"while `{other}` is *{other_label}*. "
+                        f"Consolidating would mix {grain_cat}-level and {sc.grain_b}-level rows, "
+                        f"making aggregation unreliable."
+                    )
+                elif sc.overall_score < 0.50:
+                    reasons.append(
+                        f"• **Low compatibility with `{other}`** (score {sc.overall_score:.0%}): "
+                        f"{sc.reasoning}"
+                    )
+            incompatibility_detail = "\n".join(reasons) if reasons else ""
+
+        # Per-file contributions
+        file_contributions = []
+        for fname in members:
+            fnormed = normed_by_file[fname]
+            # unique = in this file but not in any other file in the group
+            others_union: set[str] = set()
+            for f2, cols2 in normed_by_file.items():
+                if f2 != fname:
+                    others_union |= cols2
+            unique_to_file = fnormed - others_union
+            common_in_file = fnormed & common_cols
+            kpi_in_file = len(fnormed & _kpi_referenced)
+            discardable_in_file = len(fnormed - _kpi_referenced)
+
+            file_contributions.append(FileContribution(
+                file_name=fname,
+                total_columns=len(fnormed),
+                kpi_columns=kpi_in_file,
+                common_columns_contributed=len(common_in_file),
+                unique_columns_contributed=len(unique_to_file),
+                discardable_columns=discardable_in_file,
+            ))
+
         groups.append(ConsolidationGroup(
             group_id=group_id,
             group_label=f"{grain_cat.replace('_', ' ').title()} Group {group_id}",
@@ -235,9 +324,80 @@ def _build_groups(
             recommendation=recommendation,
             expected_master_columns=len(union_cols),
             reasoning=reasoning,
+            incompatibility_detail=incompatibility_detail,
+            file_contributions=file_contributions,
         ))
 
     return groups
+
+
+def _compute_kpi_alignments(
+    file_names: list[str],
+    col_map: dict[str, list[str]],
+    kpi_referenced: set[str],
+    kpi_label_map: dict[str, list[str]],
+) -> list[KpiAlignment]:
+    """Compute per-file KPI column alignment using exact canonical matching + fuzzy fallback."""
+    alignments: list[KpiAlignment] = []
+
+    # Build per-file normalized column map
+    normed_by_file: dict[str, dict[str, str]] = {}  # file → {canonical → raw_col}
+    for fname in file_names:
+        mapping: dict[str, str] = {}
+        for raw_col in col_map.get(fname, []):
+            canonical = normalize_column_name(raw_col)
+            mapping[canonical] = raw_col
+        normed_by_file[fname] = mapping
+
+    for canonical in sorted(kpi_referenced):
+        labels = kpi_label_map.get(canonical, [])
+        per_file_match: dict[str, str] = {}
+        per_file_confidence: dict[str, float] = {}
+
+        for fname in file_names:
+            mapping = normed_by_file.get(fname, {})
+            if canonical in mapping:
+                per_file_match[fname] = mapping[canonical]
+                per_file_confidence[fname] = 1.0
+            else:
+                # Fuzzy match against all raw columns
+                best_col = ""
+                best_score = 0.0
+                if _RAPIDFUZZ_AVAILABLE:
+                    for raw_col in col_map.get(fname, []):
+                        score = _fuzz.token_sort_ratio(canonical, normalize_column_name(raw_col)) / 100.0
+                        if score > best_score:
+                            best_score = score
+                            best_col = raw_col
+                if best_score >= 0.70:
+                    per_file_match[fname] = best_col
+                    per_file_confidence[fname] = best_score
+                else:
+                    per_file_match[fname] = ""
+                    per_file_confidence[fname] = 0.0
+
+        files_with_match = [f for f in file_names if per_file_match.get(f)]
+        if len(files_with_match) == len(file_names):
+            status = "aligned"
+            suggestion = "All files cover this KPI column."
+        elif files_with_match:
+            missing = [f for f in file_names if not per_file_match.get(f)]
+            suggestion = f"Present in {len(files_with_match)} of {len(file_names)} files. Missing from: {', '.join(missing)}."
+            status = "partial"
+        else:
+            status = "missing"
+            suggestion = "KPI column not found in any file."
+
+        alignments.append(KpiAlignment(
+            canonical_kpi=canonical,
+            kpi_labels=labels,
+            per_file_match=per_file_match,
+            per_file_confidence=per_file_confidence,
+            status=status,
+            suggestion=suggestion,
+        ))
+
+    return alignments
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +514,7 @@ def run(
             signals={"overall_score": sc.overall_score, "grain_compatible": sc.grain_compatible},
         ))
 
-    groups = _build_groups(file_names, pairwise_scores, grain_map, col_map, kpi_result)
+    groups = _build_groups(file_names, pairwise_scores, grain_map, col_map, kpi_result, kpi_referenced)
 
     all_normed: set[str] = set()
     for cols in col_map.values():
@@ -436,6 +596,8 @@ def run(
         exclude_files=[],
     )
 
+    kpi_alignments = _compute_kpi_alignments(file_names, col_map, kpi_referenced, kpi_label_map)
+
     intelligence_result = ConsolidationIntelligenceResult(
         file_profiles=file_profiles,
         pairwise_scores=pairwise_scores,
@@ -443,6 +605,7 @@ def run(
         discard_analysis=discard_analysis,
         final_recommendation=final_rec,
         visual_map=visual_map,
+        kpi_alignments=kpi_alignments,
     )
 
     # ── Phase B: Strategy ──────────────────────────────────────────────────

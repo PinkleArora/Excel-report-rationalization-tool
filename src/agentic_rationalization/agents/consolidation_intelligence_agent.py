@@ -6,28 +6,34 @@ This module re-exports everything from there so existing imports keep working.
 
 from src.agentic_rationalization.agents.consolidation_agent import (
     FileProfile,
+    FileContribution,
     ConsolidationGroup,
     ColumnDiscardRec,
     DiscardAnalysis,
     FinalRecommendation,
+    KpiAlignment,
     ConsolidationIntelligenceResult,
     _build_union_find,
     _find,
     _union,
     _build_groups,
+    _compute_kpi_alignments,
     run,
 )
 
 __all__ = [
     "FileProfile",
+    "FileContribution",
     "ConsolidationGroup",
     "ColumnDiscardRec",
     "DiscardAnalysis",
     "FinalRecommendation",
+    "KpiAlignment",
     "ConsolidationIntelligenceResult",
     "_build_union_find",
     "_find",
     "_union",
     "_build_groups",
+    "_compute_kpi_alignments",
     "run",
 ]
