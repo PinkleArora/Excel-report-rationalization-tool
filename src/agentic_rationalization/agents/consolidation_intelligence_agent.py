@@ -12,12 +12,14 @@ from src.agentic_rationalization.agents.consolidation_agent import (
     DiscardAnalysis,
     FinalRecommendation,
     KpiAlignment,
+    WorkbookKpiStats,
     ConsolidationIntelligenceResult,
     _build_union_find,
     _find,
     _union,
     _build_groups,
     _compute_kpi_alignments,
+    compute_file_group_compatibility,
     run,
 )
 
@@ -29,11 +31,13 @@ __all__ = [
     "DiscardAnalysis",
     "FinalRecommendation",
     "KpiAlignment",
+    "WorkbookKpiStats",
     "ConsolidationIntelligenceResult",
     "_build_union_find",
     "_find",
     "_union",
     "_build_groups",
     "_compute_kpi_alignments",
+    "compute_file_group_compatibility",
     "run",
 ]

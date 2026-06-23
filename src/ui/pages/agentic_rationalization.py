@@ -449,10 +449,18 @@ def _render_step_2() -> None:
 
     if step == 2:
         if st.button("✅ Confirm Source Tabs & Continue", type="primary", key="ar_btn_confirm_discovery"):
-            # Run consolidation now so step 3 has data immediately
+            with st.spinner("Running KPI Analysis…"):
+                try:
+                    kpi_result_obj = run_kpi_phase(bundles, config)
+                    st.session_state[_SS_KPI] = kpi_result_obj
+                except Exception as exc:
+                    st.error(f"KPI analysis failed: `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc(), language="python")
+                    return
             with st.spinner("Running Consolidation Intelligence…"):
                 try:
-                    consol = run_consolidation_phase(bundles, config)
+                    kpi_analysis = kpi_result_obj.output if kpi_result_obj else None
+                    consol = run_consolidation_phase(bundles, config, kpi_result=kpi_analysis)
                     st.session_state[_SS_CONSOLIDATION] = consol
                 except Exception as exc:
                     st.error(f"Consolidation analysis failed: `{type(exc).__name__}: {exc}`")
@@ -572,6 +580,30 @@ def _build_group_analysis_xlsx(intel) -> bytes:
     return buf.getvalue()
 
 
+def _build_compatibility_matrix_xlsx(intel) -> bytes:
+    """Compatibility Matrix: per-file compatibility scores vs each group."""
+    from src.agentic_rationalization.agents.consolidation_agent import compute_file_group_compatibility
+    rows = []
+    for fp in intel.file_profiles:
+        compat = compute_file_group_compatibility(fp.file_name, intel.groups, intel.pairwise_scores)
+        for gid, scores in compat.items():
+            rows.append({
+                "File":            fp.file_name,
+                "Group":           f"Group {gid}",
+                "Grain Score":     f"{scores['grain_score']:.0%}",
+                "KPI Score":       f"{scores['kpi_score']:.0%}",
+                "Schema Score":    f"{scores['schema_score']:.0%}",
+                "Key Score":       f"{scores['key_score']:.0%}",
+                "Time Score":      f"{scores['time_score']:.0%}",
+                "Overall Score":   f"{scores['overall_score']:.0%}",
+                "Recommendation":  scores["recommendation"],
+            })
+    df = pd.DataFrame(rows)
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, sheet_name="Compatibility Matrix")
+    return buf.getvalue()
+
+
 def _apply_group_overrides(groups, overrides: dict) -> list:
     """Return modified groups list after applying manual overrides."""
     if not overrides:
@@ -647,8 +679,9 @@ def _render_step_3() -> None:
     group_overrides: dict = st.session_state.get(_SS_GROUP_OVERRIDES, {})
     effective_groups = _apply_group_overrides(intel.groups, group_overrides)
 
-    tab_profiles, tab_groups, tab_pairwise, tab_kpi, tab_overrides = st.tabs([
+    tab_profiles, tab_kpi_disc, tab_groups, tab_pairwise, tab_kpi_align, tab_overrides = st.tabs([
         "File Profiles",
+        "KPI Discovery",
         "Consolidation Groups",
         "5-Dimension Scores",
         "KPI Alignment",
@@ -661,9 +694,16 @@ def _render_step_3() -> None:
             rows = []
             for fp in intel.file_profiles:
                 pk_str = ", ".join(fp.primary_key_candidates) if fp.primary_key_candidates else "—"
+                config_ss = st.session_state.get(_SS_CONFIG)
+                kpi_tabs_str = "—"
+                if config_ss:
+                    wb_cfg_fp = config_ss.config_for(fp.file_name)
+                    if wb_cfg_fp and hasattr(wb_cfg_fp, "kpi_tabs") and wb_cfg_fp.kpi_tabs:
+                        kpi_tabs_str = ", ".join(wb_cfg_fp.kpi_tabs)
                 rows.append({
                     "File":              fp.file_name,
                     "Source Tab":        fp.source_tab,
+                    "KPI Tabs":          kpi_tabs_str,
                     "Rows":              fp.row_count,
                     "Total Columns":     fp.column_count,
                     "Distinct Columns":  fp.distinct_columns,
@@ -678,7 +718,25 @@ def _render_step_3() -> None:
         else:
             st.info("No file profiles available.")
 
-    # ── Tab 2: Consolidation Groups ───────────────────────────────────────────
+    # ── Tab 2: KPI Discovery ──────────────────────────────────────────────────
+    with tab_kpi_disc:
+        wb_kpi_stats = getattr(intel, "workbook_kpi_stats", [])
+        if not wb_kpi_stats:
+            st.info("KPI Discovery data not available. Run from Step 1.")
+        else:
+            for wks in wb_kpi_stats:
+                with st.expander(f"**{wks.workbook_name}**", expanded=True):
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("KPI Tabs Found", len(wks.kpi_tabs))
+                    c2.metric("KPI Formulas", wks.formula_count)
+                    c3.metric("KPI Columns", wks.kpi_column_count)
+                    c4.metric("Detection Confidence", f"{wks.detection_confidence:.0%}")
+                    if wks.kpi_tabs:
+                        st.caption(f"KPI Tabs: {', '.join(wks.kpi_tabs)}")
+                    if wks.reason_if_empty:
+                        st.warning(f"**Why no KPIs detected:** {wks.reason_if_empty}")
+
+    # ── Tab 3: Consolidation Groups ───────────────────────────────────────────
     with tab_groups:
         if not effective_groups:
             st.info("No groups detected.")
@@ -709,6 +767,7 @@ def _render_step_3() -> None:
                                 "File":                  fc.file_name,
                                 "Total Cols":            fc.total_columns,
                                 "KPI Cols":              fc.kpi_columns,
+                                "Key/Grain Cols":        getattr(fc, "key_columns", 0),
                                 "Common Contributed":    fc.common_columns_contributed,
                                 "Unique Contributed":    fc.unique_columns_contributed,
                                 "Discardable":           fc.discardable_columns,
@@ -782,8 +841,20 @@ def _render_step_3() -> None:
                 )
             except Exception as e:
                 st.caption(f"Group analysis unavailable: {e}")
+        dl5_row = st.columns(4)
+        with dl5_row[0]:
+            try:
+                xlsx = _build_compatibility_matrix_xlsx(intel)
+                st.download_button(
+                    "Compatibility Matrix.xlsx", data=xlsx,
+                    file_name="Compatibility_Matrix.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_compat_matrix",
+                )
+            except Exception as e:
+                st.caption(f"Compatibility matrix unavailable: {e}")
 
-    # ── Tab 3: 5-Dimension Scores ─────────────────────────────────────────────
+    # ── Tab 4: 5-Dimension Scores ─────────────────────────────────────────────
     with tab_pairwise:
         if not intel.pairwise_scores:
             st.info("No pairwise scores available (single file or no comparison possible).")
@@ -817,8 +888,8 @@ def _render_step_3() -> None:
                             f"report would overcounts rows."
                         )
 
-    # ── Tab 4: KPI Alignment ──────────────────────────────────────────────────
-    with tab_kpi:
+    # ── Tab 5: KPI Alignment ──────────────────────────────────────────────────
+    with tab_kpi_align:
         kpi_alignments = getattr(intel, "kpi_alignments", [])
         if not kpi_alignments:
             st.info("No KPI columns identified. Run KPI analysis first or upload files with KPI definitions.")
@@ -881,8 +952,32 @@ def _render_step_3() -> None:
                     missing_rows = [{"Canonical": a.canonical_kpi, "KPI Label(s)": ", ".join(a.kpi_labels)} for a in missing]
                     st.dataframe(pd.DataFrame(missing_rows), use_container_width=True, hide_index=True)
 
-    # ── Tab 5: Manual Group Overrides ────────────────────────────────────────
+    # ── Tab 6: Manual Group Overrides ────────────────────────────────────────
     with tab_overrides:
+        # ── Decision Support: Compatibility Matrix ────────────────────────────
+        st.markdown("### Decision Support")
+        st.caption("Compatibility scores between each file and each group to guide your manual decisions.")
+        from src.agentic_rationalization.agents.consolidation_agent import compute_file_group_compatibility
+        compat_rows = []
+        for fp_compat in intel.file_profiles:
+            compat = compute_file_group_compatibility(fp_compat.file_name, intel.groups, intel.pairwise_scores)
+            for gid, scores in compat.items():
+                compat_rows.append({
+                    "File":           fp_compat.file_name,
+                    "Group":          f"Group {gid}",
+                    "Grain Score":    f"{scores['grain_score']:.0%}",
+                    "KPI Score":      f"{scores['kpi_score']:.0%}",
+                    "Schema Score":   f"{scores['schema_score']:.0%}",
+                    "Key Score":      f"{scores['key_score']:.0%}",
+                    "Time Score":     f"{scores['time_score']:.0%}",
+                    "Overall Score":  f"{scores['overall_score']:.0%}",
+                    "Recommendation": scores["recommendation"],
+                })
+        if compat_rows:
+            st.dataframe(pd.DataFrame(compat_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Compatibility matrix not available (requires multiple files).")
+        st.markdown("---")
         st.markdown(
             "Use these controls to move files between groups, exclude files, "
             "or create new groups. Click **Apply Overrides** to update the workspace."
