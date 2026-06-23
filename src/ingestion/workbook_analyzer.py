@@ -418,8 +418,13 @@ def build_dependency_report_df(analyses: list[WorkbookAnalysis]) -> pd.DataFrame
 # Signal extraction
 # ---------------------------------------------------------------------------
 
-def _extract_signals(raw_ws: Any, df: pd.DataFrame) -> SignalVector:
-    """Compute all measurable signals from a worksheet."""
+def _extract_signals(raw_ws: Any, df: pd.DataFrame, max_scan_rows: int = 500) -> SignalVector:
+    """Compute all measurable signals from a worksheet.
+
+    For large worksheets the cell scan is capped at *max_scan_rows* to keep
+    discovery fast.  Classification signals (formula density, inter-sheet refs)
+    are estimated from the sample, which is accurate enough for tab typing.
+    """
     row_count = len(df)
     col_count = len(df.columns)
 
@@ -447,8 +452,12 @@ def _extract_signals(raw_ws: Any, df: pd.DataFrame) -> SignalVector:
     non_empty = 0
     agg_funcs = 0
     referenced_sheets: set[str] = set()
+    rows_scanned = 0
 
     for row in raw_ws.iter_rows():
+        if rows_scanned >= max_scan_rows:
+            break
+        rows_scanned += 1
         for cell in row:
             if cell.value is None:
                 continue
@@ -463,7 +472,17 @@ def _extract_signals(raw_ws: Any, df: pd.DataFrame) -> SignalVector:
                 if _has_aggregate_function(formula):
                     agg_funcs += 1
 
-    formula_density = formula_cells / non_empty if non_empty > 0 else 0.0
+    # If we sampled fewer rows than the full sheet, scale formula_cells up
+    # proportionally so formula_density reflects the whole tab accurately.
+    if rows_scanned > 0 and row_count > rows_scanned:
+        scale = row_count / rows_scanned
+        formula_cells_est = int(formula_cells * scale)
+        non_empty_est     = int(non_empty * scale)
+    else:
+        formula_cells_est = formula_cells
+        non_empty_est     = non_empty
+
+    formula_density = formula_cells_est / non_empty_est if non_empty_est > 0 else 0.0
 
     return SignalVector(
         row_count=row_count,
@@ -478,6 +497,9 @@ def _extract_signals(raw_ws: Any, df: pd.DataFrame) -> SignalVector:
         avg_unique_ratio=round(avg_unique_ratio, 4),
         dtype_homogeneity=round(dtype_homogeneity, 4),
     )
+
+
+_LARGE_SHEET_ROW_THRESHOLD = 500  # sheets with more rows use sampled scan
 
 
 def _compute_avg_unique_ratio(df: pd.DataFrame) -> float:

@@ -449,22 +449,15 @@ def _render_step_2() -> None:
 
     if step == 2:
         if st.button("✅ Confirm Source Tabs & Continue", type="primary", key="ar_btn_confirm_discovery"):
-            kpi_result_obj = None
-            with st.spinner("Running KPI Analysis…"):
+            with st.spinner("Analysing KPI formulas and grouping files… (this may take a moment for large workbooks)"):
                 try:
                     kpi_result_obj = run_kpi_phase(bundles, config)
                     st.session_state[_SS_KPI] = kpi_result_obj
-                except Exception as exc:
-                    st.error(f"KPI analysis failed: `{type(exc).__name__}: {exc}`")
-                    st.code(traceback.format_exc(), language="python")
-                    return
-            with st.spinner("Running Consolidation Intelligence…"):
-                try:
                     kpi_analysis = kpi_result_obj.output if kpi_result_obj else None
                     consol = run_consolidation_phase(bundles, config, kpi_result=kpi_analysis)
                     st.session_state[_SS_CONSOLIDATION] = consol
                 except Exception as exc:
-                    st.error(f"Consolidation analysis failed: `{type(exc).__name__}: {exc}`")
+                    st.error(f"Analysis failed: `{type(exc).__name__}: {exc}`")
                     st.code(traceback.format_exc(), language="python")
                     return
             _set_step(3)
