@@ -705,6 +705,12 @@ def _render_step_3() -> None:
             rows = []
             for fp in intel.file_profiles:
                 pk_str = ", ".join(fp.primary_key_candidates) if fp.primary_key_candidates else "—"
+                config_ss = st.session_state.get(_SS_CONFIG)
+                kpi_tabs_str = "—"
+                if config_ss:
+                    wb_cfg_fp = config_ss.config_for(fp.file_name)
+                    if wb_cfg_fp and hasattr(wb_cfg_fp, "kpi_tabs") and wb_cfg_fp.kpi_tabs:
+                        kpi_tabs_str = ", ".join(wb_cfg_fp.kpi_tabs)
                 rows.append({
                     "File":              fp.file_name,
                     "Source Tab":        fp.source_tab,

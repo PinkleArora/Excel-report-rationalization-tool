@@ -152,6 +152,16 @@ class KpiAlignment:
 
 
 @dataclass
+class WorkbookKpiStats:
+    workbook_name: str
+    kpi_tabs: list[str]
+    formula_count: int
+    kpi_column_count: int    # count of canonical KPI columns this workbook contributes
+    detection_confidence: float
+    reason_if_empty: str     # e.g. "No formulas found" if kpi_column_count == 0
+
+
+@dataclass
 class ConsolidationIntelligenceResult:
     file_profiles: list[FileProfile]
     pairwise_scores: list[CompatibilityScore]
