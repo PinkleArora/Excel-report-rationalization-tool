@@ -1484,9 +1484,17 @@ def _render_step_5() -> None:
                 "The decision below reflects agent analysis + any overrides you applied."
             )
             for p in similar_profiles:
+                # similar_to is list[str] per ColumnProfile contract
+                similar_to_val = getattr(p, "similar_to", None)
+                if isinstance(similar_to_val, list):
+                    similar_to_names: list[str] = similar_to_val
+                elif isinstance(similar_to_val, str):
+                    similar_to_names = [similar_to_val]
+                else:
+                    similar_to_names = []
                 kpi_vetoed = (
                     p.canonical_name in kpi_referenced_set
-                    and getattr(p, "similar_to", None) in kpi_referenced_set
+                    and any(s in kpi_referenced_set for s in similar_to_names)
                 )
                 verdict_color = "orange"
                 verdict_text  = "KEPT SEPARATE"
@@ -1497,9 +1505,10 @@ def _render_step_5() -> None:
                     verdict_color = "gray"
                     verdict_text  = "EXCLUDED"
 
+                similar_to_display = ", ".join(similar_to_names) if similar_to_names else "—"
                 c1, c2, c3 = st.columns([2, 2, 3])
                 c1.markdown(f"**`{p.canonical_name}`**")
-                c2.markdown(f"Similar to: `{getattr(p, 'similar_to', '—')}`")
+                c2.markdown(f"Similar to: `{similar_to_display}`")
                 conf = getattr(p, "similarity_score", None) or getattr(p, "confidence", 0.0)
                 c3.markdown(f":{verdict_color}[{verdict_text}]  similarity: {conf:.0%}")
                 if kpi_vetoed:

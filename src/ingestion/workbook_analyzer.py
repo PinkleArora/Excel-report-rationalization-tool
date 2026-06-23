@@ -680,10 +680,13 @@ def _extract_kpis(
     sheet_name: str,
     wb_name: str,
     headers_by_sheet: dict[str, list[str]],
+    max_scan_rows: int = 500,
 ) -> list[KPIDefinition]:
     kpis: list[KPIDefinition] = []
 
-    for row in raw_ws.iter_rows():
+    for row_idx_0, row in enumerate(raw_ws.iter_rows()):
+        if row_idx_0 >= max_scan_rows:
+            break
         for cell in row:
             if not (isinstance(cell.value, str) and cell.value.startswith("=")):
                 continue
