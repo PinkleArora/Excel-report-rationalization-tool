@@ -18,7 +18,6 @@ from src.agentic_rationalization.agents import (
     kpi_agent,
     schema_agent,
     consolidation_agent,
-    consolidation_intelligence_agent,
     generation_agent,
     validation_agent,
 )
@@ -110,11 +109,7 @@ def run_pipeline(
     agent_results.append(schema_result_obj)
     source_analysis = schema_result_obj.output
 
-    # Phase 3b — Consolidation Intelligence (grain, compatibility, grouping)
-    ci_result = consolidation_intelligence_agent.run(bundles, config, kpi_analysis, source_analysis)
-    agent_results.append(ci_result)
-
-    # Phase 4 — Consolidation Strategy
+    # Phase 4 — Consolidation (intelligence + strategy, merged agent)
     consol_result = consolidation_agent.run(bundles, config, source_analysis, kpi_analysis)
     _apply_overrides(consol_result, _overrides)
     agent_results.append(consol_result)
