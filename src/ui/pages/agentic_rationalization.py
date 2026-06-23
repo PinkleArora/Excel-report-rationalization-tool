@@ -72,7 +72,7 @@ def _reset_state() -> None:
         _SS_STEP, _SS_BUNDLES, _SS_CONFIG, _SS_DISCOVERY, _SS_CONSOLIDATION,
         _SS_SELECTED_GROUP, _SS_SCHEMA, _SS_KPI, _SS_VALIDATION, _SS_GENERATION,
         _SS_SOURCE_TAB_OVERRIDES, _SS_GROUP_OVERRIDES, _SS_KPI_ALIGN_DECISIONS,
-        _OVERRIDES_KEY, _ACTION_KEY,
+        _OVERRIDES_KEY, _ACTION_KEY, "ar_kpi_tab_overrides",
     ]:
         st.session_state.pop(key, None)
 
@@ -354,10 +354,15 @@ def _render_step_2() -> None:
     discovery_result: AgentResult | None = st.session_state.get(_SS_DISCOVERY)
     if discovery_result is None:
         overrides = st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {})
+        kpi_overrides = st.session_state.get("ar_kpi_tab_overrides", {})
         # Convert flat overrides {file_name: tab_name} to discovery_agent format
-        discovery_overrides = {
+        discovery_overrides: dict[str, dict] = {
             fname: {"source_tab": tab} for fname, tab in overrides.items()
         }
+        for fname, kpi_tabs_list in kpi_overrides.items():
+            if fname not in discovery_overrides:
+                discovery_overrides[fname] = {}
+            discovery_overrides[fname]["kpi_tabs"] = kpi_tabs_list
         with st.spinner("Running Discovery Agent…"):
             try:
                 discovery_result = run_discovery_phase(bundles, overrides=discovery_overrides)
@@ -413,32 +418,78 @@ def _render_step_2() -> None:
                     col_count   = fp.column_count
 
         with st.container(border=True):
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                st.markdown(f"**📁 {fname}**")
-                conf_icon = _conf_color(tab_conf)
-                conf_pct  = f"{tab_conf:.0%}" if tab_conf > 0 else "—"
-                st.caption(
-                    f"Source Tab: `{source_tab}`  {conf_icon} confidence: {conf_pct}   |   "
-                    f"KPI Tabs: {', '.join(kpi_tabs) if kpi_tabs else '—'}"
-                )
+            st.markdown(f"**📁 {fname}**")
+
+            # Source tab confidence
+            src_conf_icon = _conf_color(tab_conf)
+            src_conf_pct  = f"{tab_conf:.0%}" if tab_conf > 0 else "—"
+            low_conf_src  = tab_conf > 0 and tab_conf < 0.85
+
+            # Find KPI tab confidence
+            kpi_tab_confs: dict[str, float] = {}
+            for d in discovery_result.decisions:
+                for kt in kpi_tabs:
+                    if d.subject == f"{fname} / {kt}":
+                        kpi_tab_confs[kt] = d.confidence
+            kpi_conf_avg = sum(kpi_tab_confs.values()) / len(kpi_tab_confs) if kpi_tab_confs else 0.0
+            kpi_conf_icon = _conf_color(kpi_conf_avg) if kpi_conf_avg > 0 else "⚪"
+            low_conf_kpi  = kpi_conf_avg > 0 and kpi_conf_avg < 0.85
+
+            r1c1, r1c2, r1c3 = st.columns([2, 2, 1])
+            with r1c1:
+                st.markdown(f"**Source Tab:** `{source_tab}` {src_conf_icon} {src_conf_pct}")
+                if low_conf_src:
+                    st.caption("⚠️ Low confidence — consider overriding")
+            with r1c2:
+                kpi_str = ", ".join(f"`{t}`" for t in kpi_tabs) if kpi_tabs else "*(none detected)*"
+                st.markdown(f"**KPI Tab(s):** {kpi_str} {kpi_conf_icon}")
+                if not kpi_tabs:
+                    st.caption("⚠️ No KPI tabs found — formulas may be pivot-based")
+                elif low_conf_kpi:
+                    st.caption("⚠️ Low confidence KPI tab identification")
+            with r1c3:
                 if row_count:
-                    st.caption(f"Rows: {row_count:,} | Columns: {col_count} | Grain: {grain_label}")
-            with c2:
-                if all_sheets:
-                    default_idx = all_sheets.index(source_tab) if source_tab in all_sheets else 0
-                    new_tab = st.selectbox(
-                        "Change source tab:",
-                        all_sheets,
-                        index=default_idx,
-                        key=f"ar_src_tab_{fname}",
-                    )
-                    if new_tab != source_tab:
-                        src_overrides[fname] = new_tab
-                        changed = True
+                    st.caption(f"**{row_count:,}** rows")
+                    st.caption(f"Grain: {grain_label}")
+
+            # Source/KPI tab override
+            if all_sheets:
+                with st.expander(
+                    f"Override source/KPI tab for `{fname}`",
+                    expanded=low_conf_src or low_conf_kpi or not kpi_tabs,
+                ):
+                    ov_c1, ov_c2 = st.columns(2)
+                    with ov_c1:
+                        default_idx = all_sheets.index(source_tab) if source_tab in all_sheets else 0
+                        new_tab = st.selectbox(
+                            "Source tab:",
+                            all_sheets,
+                            index=default_idx,
+                            key=f"ar_src_tab_{fname}",
+                        )
+                        if new_tab != source_tab:
+                            src_overrides[fname] = new_tab
+                            changed = True
+                    with ov_c2:
+                        kpi_defaults = [s for s in kpi_tabs if s in all_sheets]
+                        new_kpi_tabs = st.multiselect(
+                            "KPI tab(s):",
+                            all_sheets,
+                            default=kpi_defaults,
+                            key=f"ar_kpi_tabs_{fname}",
+                        )
+                        current_kpi_key = f"_kpi_tabs_{fname}"
+                        old_kpi = st.session_state.get(current_kpi_key, kpi_defaults)
+                        if sorted(new_kpi_tabs) != sorted(old_kpi):
+                            st.session_state[current_kpi_key] = new_kpi_tabs
+                            kpi_overrides = st.session_state.get("ar_kpi_tab_overrides", {})
+                            kpi_overrides[fname] = new_kpi_tabs
+                            st.session_state["ar_kpi_tab_overrides"] = kpi_overrides
+                            changed = True
 
     if changed:
         st.session_state[_SS_SOURCE_TAB_OVERRIDES] = src_overrides
+        # Include KPI tab overrides in discovery overrides on next re-run
         st.session_state.pop(_SS_DISCOVERY, None)
         st.session_state.pop(_SS_CONSOLIDATION, None)
         st.session_state.pop(_SS_SCHEMA, None)
@@ -756,6 +807,28 @@ def _render_step_3() -> None:
                             "3. Formulas that only reference other KPI-tab cells are "
                             "classified as DERIVED and may not resolve to source columns."
                         )
+
+        # KPI Lineage
+        kpi_result_obj_ln = st.session_state.get(_SS_KPI)
+        kpi_analysis_ln = kpi_result_obj_ln.output if kpi_result_obj_ln else None
+        lineage = getattr(kpi_analysis_ln, "lineage", []) if kpi_analysis_ln else []
+        if lineage:
+            st.markdown("**KPI Lineage**")
+            lineage_by_wb: dict[str, list] = {}
+            for ln in lineage:
+                lineage_by_wb.setdefault(ln.workbook_name, []).append(ln)
+            for wb_name, wb_lineage in lineage_by_wb.items():
+                with st.expander(
+                    f"🔗 {wb_name} — {len(wb_lineage)} KPI lineage path(s)", expanded=False
+                ):
+                    unique_paths = list({ln.lineage_path for ln in wb_lineage})
+                    for path in sorted(unique_paths):
+                        st.code(path, language=None)
+                    type_counts: dict[str, int] = {}
+                    for ln in wb_lineage:
+                        type_counts[ln.kpi_type] = type_counts.get(ln.kpi_type, 0) + 1
+                    for ktype, cnt in type_counts.items():
+                        st.caption(f"{ktype}: {cnt}")
 
     # ── Tab 3: Consolidation Groups ───────────────────────────────────────────
     with tab_groups:
@@ -1258,6 +1331,39 @@ def _render_step_5() -> None:
     m4.metric("Discarded Columns", discarded_count)
     m5.metric("Merged Columns", merged_count)
     m6.metric("KPI Referenced", kpi_ref_count)
+
+    # Similar column pairs highlighted section
+    similar_profiles = [p for p in all_profiles if p.match_class == "similar"]
+    if similar_profiles:
+        with st.expander(f"Similar Column Pairs — {len(similar_profiles)} pair(s)", expanded=False):
+            st.caption(
+                "These columns were identified as similar across workbooks. "
+                "The decision below reflects agent analysis + any overrides you applied."
+            )
+            for p in similar_profiles:
+                kpi_vetoed = (
+                    p.canonical_name in kpi_referenced_set
+                    and getattr(p, "similar_to", None) in kpi_referenced_set
+                )
+                verdict_color = "orange"
+                verdict_text  = "KEPT SEPARATE"
+                if kpi_vetoed:
+                    verdict_color = "red"
+                    verdict_text  = "BLOCKED BY KPI VETO"
+                elif getattr(p, "excluded", False):
+                    verdict_color = "gray"
+                    verdict_text  = "EXCLUDED"
+
+                c1, c2, c3 = st.columns([2, 2, 3])
+                c1.markdown(f"**`{p.canonical_name}`**")
+                c2.markdown(f"Similar to: `{getattr(p, 'similar_to', '—')}`")
+                conf = getattr(p, "similarity_score", None) or getattr(p, "confidence", 0.0)
+                c3.markdown(f":{verdict_color}[{verdict_text}]  similarity: {conf:.0%}")
+                if kpi_vetoed:
+                    st.caption(
+                        "KPI veto applied — both columns are referenced by KPI formulas "
+                        "and cannot be merged without breaking KPI calculations."
+                    )
 
     # Duplicate Column Decisions
     st.markdown("**Column Decisions**")

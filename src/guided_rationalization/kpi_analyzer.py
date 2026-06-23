@@ -63,6 +63,12 @@ _ROLLUP_FUNCS = frozenset({"SUM", "AVERAGE", "MAX", "MIN", "MEDIAN", "COUNT", "C
 
 FormulaType = Literal["SOURCE_BACKED", "DERIVED", "ROLLUP", "VALIDATION"]
 
+# GETPIVOTDATA("FieldName", PivotRef!$A$1, ...)
+_GETPIVOTDATA_RE = re.compile(
+    r'GETPIVOTDATA\s*\(\s*"([^"]+)"\s*,\s*\'?([A-Za-z0-9_][\w\s]*?)\'?\s*!',
+    re.IGNORECASE,
+)
+
 
 # ── Data models ───────────────────────────────────────────────────────────────
 
@@ -86,6 +92,23 @@ class KpiDependency:
     formula_type: FormulaType = "SOURCE_BACKED"
     # Intra-sheet cells this formula was traced through (DERIVED / ROLLUP)
     traced_from_cells: list[str] = field(default_factory=list)
+    # KPI type: "FORMULA" | "GETPIVOTDATA" | "PIVOT" | "DERIVED"
+    kpi_type: str = "FORMULA"
+    # For GETPIVOTDATA: the sheet containing the pivot table
+    pivot_tab: str = ""
+
+
+@dataclass
+class KpiLineage:
+    """Data lineage path for a single KPI."""
+
+    workbook_name: str
+    kpi_tab: str
+    kpi_label: str
+    source_tab: str
+    intermediate_tabs: list[str]   # e.g. ["Pivot_Reserve"]
+    kpi_type: str                   # "FORMULA" | "GETPIVOTDATA"
+    lineage_path: str               # "SQL_data -> Pivot_Reserve -> Summary"
 
 
 @dataclass
@@ -93,10 +116,12 @@ class KpiAnalysisResult:
     """Aggregated KPI dependency analysis across all configured workbooks."""
 
     dependencies: list[KpiDependency]
-    # All canonical column names referenced by ≥1 KPI formula
+    # All canonical column names referenced by >=1 KPI formula
     referenced_canonicals: set[str]
     # Canonical names that appear in source data but are never used by any KPI
     unreferenced_canonicals: set[str]
+    # Data lineage paths
+    lineage: list[KpiLineage] = field(default_factory=list)
 
     def to_dependency_dataframe(self) -> pd.DataFrame:
         rows = []
@@ -403,10 +428,37 @@ def analyze_kpi_dependencies(
         len(dependencies), n_source, n_derived, n_rollup, n_valid,
         len(referenced), len(unreferenced),
     )
+
+    # Build lineage
+    lineage: list[KpiLineage] = []
+    seen_lineage: set[tuple[str, str, str]] = set()
+    for dep in dependencies:
+        key = (dep.workbook_name, dep.kpi_tab, dep.kpi_label)
+        if key in seen_lineage:
+            continue
+        seen_lineage.add(key)
+        wb_cfg = config.config_for(dep.workbook_name)
+        source_tab = wb_cfg.source_tab if wb_cfg else ""
+        intermediates: list[str] = []
+        if dep.kpi_type == "GETPIVOTDATA" and dep.pivot_tab and dep.pivot_tab != source_tab:
+            intermediates = [dep.pivot_tab]
+        parts = [p for p in ([source_tab] + intermediates + [dep.kpi_tab]) if p]
+        path = " -> ".join(parts)
+        lineage.append(KpiLineage(
+            workbook_name=dep.workbook_name,
+            kpi_tab=dep.kpi_tab,
+            kpi_label=dep.kpi_label,
+            source_tab=source_tab,
+            intermediate_tabs=intermediates,
+            kpi_type=dep.kpi_type,
+            lineage_path=path,
+        ))
+
     return KpiAnalysisResult(
         dependencies=dependencies,
         referenced_canonicals=referenced,
         unreferenced_canonicals=unreferenced,
+        lineage=lineage,
     )
 
 
@@ -448,7 +500,7 @@ def _parse_formula_dependency(
     if formula_type != "SOURCE_BACKED":
         refs_source_only = True
 
-    return KpiDependency(
+    dep = KpiDependency(
         workbook_name=workbook_name,
         kpi_tab=kpi_tab,
         cell_address=cell_address,
@@ -460,6 +512,20 @@ def _parse_formula_dependency(
         refs_source_tab_only=refs_source_only,
         formula_type=formula_type,
     )
+
+    # Enrich with GETPIVOTDATA field extraction
+    if "GETPIVOTDATA" in formula.upper():
+        m = _GETPIVOTDATA_RE.search(formula)
+        if m:
+            field_name = m.group(1).strip()
+            pivot_ref  = m.group(2).strip()
+            dep.pivot_tab = pivot_ref
+            dep.kpi_type  = "GETPIVOTDATA"
+            if not dep.canonical_source_columns:
+                # Add the field name as a canonical if not already resolved
+                dep.canonical_source_columns.append(normalize_column_name(field_name))
+
+    return dep
 
 
 # ── Auxiliary helpers ─────────────────────────────────────────────────────────

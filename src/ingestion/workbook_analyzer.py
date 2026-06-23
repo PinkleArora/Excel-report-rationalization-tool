@@ -550,12 +550,21 @@ def _classify_tab(
     # -----------------------------------------------------------------------
     if sv.row_count >= cfg.min_source_rows:
         scores[TabType.SOURCE_DATA] += cfg.w_row_count * min(sv.row_count / cfg.min_source_rows, 3.0)
+    # Large row count is a strong signal for source data even with formula columns
+    if sv.row_count >= 500:
+        scores[TabType.SOURCE_DATA] += cfg.w_row_count * 2.0
     if sv.formula_density <= cfg.source_formula_density_max:
         scores[TabType.SOURCE_DATA] += cfg.w_formula_density * (1.0 - sv.formula_density / max(cfg.source_formula_density_max, 0.001))
+    elif sv.row_count >= 500:
+        # Large tabs with formula columns still get partial source credit
+        scores[TabType.SOURCE_DATA] += cfg.w_formula_density * 0.5
     if sv.dtype_homogeneity >= cfg.homogeneity_source_min:
         scores[TabType.SOURCE_DATA] += cfg.w_col_homogeneity * sv.dtype_homogeneity
     if sv.inter_sheet_ref_count == 0:
         scores[TabType.SOURCE_DATA] += cfg.w_inter_sheet_refs * 0.5
+    elif sv.row_count >= 500:
+        # Referenced from other sheets is fine for large source tabs
+        scores[TabType.SOURCE_DATA] += cfg.w_inter_sheet_refs * 0.25
 
     # -----------------------------------------------------------------------
     # REFERENCE_DATA signals
