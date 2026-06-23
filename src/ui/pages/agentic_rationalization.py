@@ -11,6 +11,7 @@ import io
 import traceback
 import zipfile
 from datetime import datetime
+from typing import Any
 
 import openpyxl
 import pandas as pd
@@ -724,6 +725,20 @@ def _render_step_3() -> None:
         st.info("No intelligence output available.")
         return
 
+    # Defensive validation
+    _missing = _validate_pipeline_inputs(
+        "Step 3 — Consolidation Workspace",
+        {
+            "ConsolidationIntelligenceResult": (
+                intel,
+                ["file_profiles", "groups", "pairwise_scores", "final_recommendation"],
+            ),
+        },
+    )
+    if _missing:
+        _render_validation_error("Step 3 — Consolidation Workspace", _missing)
+        return
+
     group_overrides: dict = st.session_state.get(_SS_GROUP_OVERRIDES, {})
     effective_groups = _apply_group_overrides(intel.groups, group_overrides)
     file_names = [fp.file_name for fp in intel.file_profiles]
@@ -1210,6 +1225,20 @@ def _render_step_4() -> None:
         st.info("No groups available — nothing to select.")
         return
 
+    # Defensive validation
+    _missing = _validate_pipeline_inputs(
+        "Step 4 — Select Group",
+        {
+            "ConsolidationIntelligenceResult": (
+                intel,
+                ["groups", "file_profiles"],
+            ),
+        },
+    )
+    if _missing:
+        _render_validation_error("Step 4 — Select Group", _missing)
+        return
+
     group_overrides: dict = st.session_state.get(_SS_GROUP_OVERRIDES, {})
     effective_groups = _apply_group_overrides(intel.groups, group_overrides)
 
@@ -1313,16 +1342,18 @@ def _render_step_5() -> None:
         st.info("Schema analysis did not produce results.")
         return
 
-    # Defensive contract check — SourceAnalysisResult must have column_profiles
-    if not hasattr(source_analysis, "column_profiles"):
-        actual = [a for a in dir(source_analysis) if not a.startswith("_")]
-        st.error(
-            "**Schema Rationalization cannot start.**\n\n"
-            f"Missing: `SourceAnalysisResult.column_profiles`\n\n"
-            f"Expected: Column profile collection\n\n"
-            f"Actual attributes: `{actual}`\n\n"
-            "Agent producing this object: **SchemaAgent** — check `run_schema_phase` output."
-        )
+    # Defensive validation — ensure SourceAnalysisResult has the attributes we need
+    _missing = _validate_pipeline_inputs(
+        "Step 5 — Schema Rationalization",
+        {
+            "SourceAnalysisResult": (
+                source_analysis,
+                ["column_profiles", "common_columns", "similar_columns", "unique_columns"],
+            ),
+        },
+    )
+    if _missing:
+        _render_validation_error("Step 5 — Schema Rationalization", _missing)
         return
 
     # Schema Dashboard
@@ -1485,6 +1516,21 @@ def _render_step_6() -> None:
 
     kpi_analysis = kpi_result_obj.output
 
+    # Defensive validation (only when kpi_analysis is present)
+    if kpi_analysis is not None:
+        _missing = _validate_pipeline_inputs(
+            "Step 6 — KPI Analysis",
+            {
+                "KpiAnalysisResult": (
+                    kpi_analysis,
+                    ["dependencies", "referenced_canonicals"],
+                ),
+            },
+        )
+        if _missing:
+            _render_validation_error("Step 6 — KPI Analysis", _missing)
+            return
+
     if kpi_result_obj.warnings:
         for w in kpi_result_obj.warnings:
             st.warning(w)
@@ -1575,6 +1621,21 @@ def _render_step_7() -> None:
     kpi_analysis   = kpi_result_obj.output if kpi_result_obj else None
     gen_result     = st.session_state.get(_SS_GENERATION)
     val_result: AgentResult | None = st.session_state.get(_SS_VALIDATION)
+
+    # Defensive validation
+    if val_result is None and config is not None:
+        _missing = _validate_pipeline_inputs(
+            "Step 7 — Validation",
+            {
+                "RationalizationConfig": (
+                    config,
+                    ["future_source_tab_name", "workbook_configs"],
+                ),
+            },
+        )
+        if _missing:
+            _render_validation_error("Step 7 — Validation", _missing)
+            return
 
     if val_result is None:
         # Need master_df from generation output
@@ -1687,6 +1748,23 @@ def _render_step_8() -> None:
     if gen_result is None:
         if source_analysis is None:
             st.error("Schema analysis is required before generation. Complete Step 5 first.")
+            return
+        # Defensive validation
+        _missing = _validate_pipeline_inputs(
+            "Step 8 — Generate",
+            {
+                "SourceAnalysisResult": (
+                    source_analysis,
+                    ["column_profiles", "column_mapping", "excluded_columns"],
+                ),
+                "RationalizationConfig": (
+                    config,
+                    ["future_source_tab_name", "workbook_configs"],
+                ),
+            },
+        )
+        if _missing:
+            _render_validation_error("Step 8 — Generate", _missing)
             return
         with st.spinner("Running Generation Agent…"):
             try:
@@ -1813,6 +1891,48 @@ def _extract_resolved_frames(gen_result: AgentResult):
     if gen_result is None or not isinstance(gen_result.output, tuple):
         return []
     return gen_result.output[2] if len(gen_result.output) > 2 else []
+
+
+# ── Pipeline input validation ────────────────────────────────────────────────
+
+def _validate_pipeline_inputs(
+    step_name: str,
+    required: "dict[str, tuple[Any, list[str]]]",
+) -> "list[str]":
+    """Check that all required objects exist and expose the expected attributes.
+
+    Args:
+        step_name: Human-readable name of the step (used in error messages).
+        required: Mapping of ``description → (obj, [attr, ...])`` pairs.
+            *description* is shown to the user when an object is missing.
+            *obj* is the actual object to inspect (may be None).
+            *[attr, ...]* is the list of attribute names that must exist on *obj*.
+
+    Returns:
+        A list of human-readable missing-attribute descriptions.  Empty when
+        all checks pass.
+    """
+    missing: list[str] = []
+    for description, (obj, attrs) in required.items():
+        if obj is None:
+            missing.append(f"{description} is None (not yet produced)")
+            continue
+        for attr in attrs:
+            if not hasattr(obj, attr):
+                actual = [a for a in dir(obj) if not a.startswith("_")]
+                missing.append(
+                    f"{description}.{attr} — "
+                    f"actual attributes: {actual}"
+                )
+    return missing
+
+
+def _render_validation_error(step_name: str, missing: "list[str]") -> None:
+    """Render a styled error panel listing missing pipeline inputs."""
+    lines = [f"⚠️ {step_name} cannot start.", ""]
+    for m in missing:
+        lines.append(f"Missing: {m}")
+    st.error("\n".join(lines))
 
 
 # ── Main page ─────────────────────────────────────────────────────────────────
