@@ -79,9 +79,21 @@ class FileContribution:
     file_name: str
     total_columns: int
     kpi_columns: int
+    key_columns: int
+    grain_columns: int
     common_columns_contributed: int
     unique_columns_contributed: int
     discardable_columns: int
+
+
+@dataclass
+class WorkbookKpiStats:
+    workbook_name: str
+    kpi_tabs: list[str]
+    formula_count: int
+    kpi_column_count: int
+    detection_confidence: float
+    reason_if_empty: str
 
 
 @dataclass
@@ -147,7 +159,8 @@ class ConsolidationIntelligenceResult:
     discard_analysis: DiscardAnalysis
     final_recommendation: FinalRecommendation
     visual_map: str
-    kpi_alignments: list = field(default_factory=list)  # list[KpiAlignment]
+    kpi_alignments: list = field(default_factory=list)       # list[KpiAlignment]
+    workbook_kpi_stats: list = field(default_factory=list)   # list[WorkbookKpiStats]
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +257,17 @@ def _build_groups(
         for s in all_cols_list[1:]:
             common_cols &= s
 
+        # Grain identifiers (primary key candidates) across all files in group — normalized
+        grain_ids_union: set[str] = set()
+        for fname in members:
+            gr = grain_map.get(fname)
+            if gr:
+                for pk in gr.primary_key_candidates:
+                    grain_ids_union.add(normalize_column_name(pk))
+
         kpi_required = len(union_cols & _kpi_referenced)
-        discardable = len(union_cols - _kpi_referenced - common_cols)
+        essential = _kpi_referenced | grain_ids_union
+        discardable = len(union_cols - essential)
 
         grain_cat = grain_map[root].grain_category if root in grain_map else "unknown"
         grain_counts = Counter(grain_map[f].grain_category for f in members if f in grain_map)
@@ -301,12 +323,24 @@ def _build_groups(
             unique_to_file = fnormed - others_union
             common_in_file = fnormed & common_cols
             kpi_in_file = len(fnormed & _kpi_referenced)
-            discardable_in_file = len(fnormed - _kpi_referenced)
+
+            # Grain/key identifiers specific to this file
+            file_grain_ids: set[str] = set()
+            gr = grain_map.get(fname)
+            if gr:
+                for pk in gr.primary_key_candidates:
+                    file_grain_ids.add(normalize_column_name(pk))
+            key_col_count = len(fnormed & file_grain_ids)
+            # Discardable = not KPI, not grain identifier
+            file_essential = _kpi_referenced | file_grain_ids
+            discardable_in_file = len(fnormed - file_essential)
 
             file_contributions.append(FileContribution(
                 file_name=fname,
                 total_columns=len(fnormed),
                 kpi_columns=kpi_in_file,
+                key_columns=key_col_count,
+                grain_columns=key_col_count,
                 common_columns_contributed=len(common_in_file),
                 unique_columns_contributed=len(unique_to_file),
                 discardable_columns=discardable_in_file,
@@ -336,18 +370,39 @@ def _compute_kpi_alignments(
     col_map: dict[str, list[str]],
     kpi_referenced: set[str],
     kpi_label_map: dict[str, list[str]],
+    kpi_result=None,
 ) -> list[KpiAlignment]:
-    """Compute per-file KPI column alignment using exact canonical matching + fuzzy fallback."""
+    """Compute per-file KPI column alignment.
+
+    Primary strategy: use per-workbook KPI dependency data (KpiDependency objects)
+    to find which KPI formula labels reference each canonical column per file.
+    Fallback: exact canonical matching + fuzzy column name matching.
+    """
     alignments: list[KpiAlignment] = []
 
-    # Build per-file normalized column map
-    normed_by_file: dict[str, dict[str, str]] = {}  # file → {canonical → raw_col}
+    # Build per-file normalized column map: file → {canonical → raw_col}
+    normed_by_file: dict[str, dict[str, str]] = {}
     for fname in file_names:
         mapping: dict[str, str] = {}
         for raw_col in col_map.get(fname, []):
             canonical = normalize_column_name(raw_col)
-            mapping[canonical] = raw_col
+            if canonical not in mapping:
+                mapping[canonical] = raw_col
         normed_by_file[fname] = mapping
+
+    # Build per-file KPI dependency map: file → {canonical → [kpi_label, ...]}
+    # from kpi_result.dependencies (KpiDependency objects)
+    dep_map: dict[str, dict[str, list[str]]] = {f: {} for f in file_names}
+    if kpi_result is not None:
+        for dep in getattr(kpi_result, "dependencies", []):
+            wb = dep.workbook_name
+            if wb not in dep_map:
+                continue
+            for canonical in dep.canonical_source_columns:
+                dep_map[wb].setdefault(canonical, [])
+                label = dep.kpi_label
+                if label and label not in dep_map[wb][canonical]:
+                    dep_map[wb][canonical].append(label)
 
     for canonical in sorted(kpi_referenced):
         labels = kpi_label_map.get(canonical, [])
@@ -355,10 +410,15 @@ def _compute_kpi_alignments(
         per_file_confidence: dict[str, float] = {}
 
         for fname in file_names:
-            mapping = normed_by_file.get(fname, {})
-            if canonical in mapping:
-                per_file_match[fname] = mapping[canonical]
+            # Primary: check if this file's KPI dependencies reference the canonical
+            if canonical in dep_map.get(fname, {}):
+                dep_labels = dep_map[fname][canonical]
+                per_file_match[fname] = ", ".join(dep_labels) if dep_labels else canonical
                 per_file_confidence[fname] = 1.0
+            elif canonical in normed_by_file.get(fname, {}):
+                # Exact column presence (no KPI dep but column exists)
+                per_file_match[fname] = normed_by_file[fname][canonical]
+                per_file_confidence[fname] = 0.90
             else:
                 # Fuzzy match against all raw columns
                 best_col = ""
@@ -381,8 +441,8 @@ def _compute_kpi_alignments(
             status = "aligned"
             suggestion = "All files cover this KPI column."
         elif files_with_match:
-            missing = [f for f in file_names if not per_file_match.get(f)]
-            suggestion = f"Present in {len(files_with_match)} of {len(file_names)} files. Missing from: {', '.join(missing)}."
+            missing_files = [f for f in file_names if not per_file_match.get(f)]
+            suggestion = f"Present in {len(files_with_match)} of {len(file_names)} files. Missing from: {', '.join(missing_files)}."
             status = "partial"
         else:
             status = "missing"
@@ -398,6 +458,100 @@ def _compute_kpi_alignments(
         ))
 
     return alignments
+
+
+def _compute_workbook_kpi_stats(
+    file_names: list[str],
+    kpi_result,
+    config,
+) -> list[WorkbookKpiStats]:
+    """Compute per-workbook KPI discovery statistics."""
+    stats: list[WorkbookKpiStats] = []
+    deps = getattr(kpi_result, "dependencies", []) if kpi_result is not None else []
+
+    for fname in file_names:
+        wb_cfg = config.config_for(fname) if config is not None else None
+        kpi_tabs = list(wb_cfg.kpi_tabs) if wb_cfg and wb_cfg.kpi_tabs else []
+
+        file_deps = [d for d in deps if d.workbook_name == fname]
+        formula_count = len(file_deps)
+        kpi_canonicals: set[str] = set()
+        for d in file_deps:
+            kpi_canonicals.update(d.canonical_source_columns)
+        kpi_col_count = len(kpi_canonicals)
+
+        if kpi_col_count > 0:
+            confidence = 0.95
+            reason = ""
+        elif formula_count > 0:
+            confidence = 0.50
+            reason = "KPI formulas found but no source-data column dependencies resolved."
+        elif kpi_tabs:
+            confidence = 0.0
+            reason = "No KPI formulas found referencing source-data columns. KPI tab may contain static values only."
+        else:
+            confidence = 0.0
+            reason = "No KPI tabs configured for this workbook."
+
+        stats.append(WorkbookKpiStats(
+            workbook_name=fname,
+            kpi_tabs=kpi_tabs,
+            formula_count=formula_count,
+            kpi_column_count=kpi_col_count,
+            detection_confidence=confidence,
+            reason_if_empty=reason,
+        ))
+    return stats
+
+
+def compute_file_group_compatibility(
+    file_name: str,
+    groups: list[ConsolidationGroup],
+    pairwise_scores: list[CompatibilityScore],
+) -> dict:
+    """Return compatibility scores between a file and each group.
+
+    Result: {group_id: {overall_score, grain_score, schema_score, kpi_score,
+                        key_score, time_score, recommendation}}
+    """
+    pair_map: dict[tuple[str, str], CompatibilityScore] = {}
+    for sc in pairwise_scores:
+        pair_map[(sc.file_a, sc.file_b)] = sc
+        pair_map[(sc.file_b, sc.file_a)] = sc
+
+    result: dict[int, dict] = {}
+    for group in groups:
+        members = [m for m in group.file_names if m != file_name]
+        scores = [pair_map.get((file_name, m)) for m in members]
+        scores = [s for s in scores if s is not None]
+
+        if not scores:
+            result[group.group_id] = {
+                "overall_score": 0.0, "grain_score": 0.0,
+                "schema_score": 0.0, "kpi_score": 0.0,
+                "key_score": 0.0, "time_score": 0.0,
+                "recommendation": "Unknown",
+            }
+            continue
+
+        avg_overall = sum(s.overall_score for s in scores) / len(scores)
+        avg_schema  = sum(s.schema_overlap_pct for s in scores) / len(scores)
+        avg_kpi     = sum(s.kpi_overlap_pct for s in scores) / len(scores)
+        all_grain   = all(s.grain_compatible for s in scores)
+        all_key     = all(s.key_compatible for s in scores)
+        all_time    = all(s.time_dimension_compatible for s in scores)
+        rec = "Consolidate" if (avg_overall >= 0.50 and all_grain) else "Keep Separate"
+
+        result[group.group_id] = {
+            "overall_score": avg_overall,
+            "grain_score":   1.0 if all_grain else 0.0,
+            "schema_score":  avg_schema,
+            "kpi_score":     avg_kpi,
+            "key_score":     1.0 if all_key else 0.0,
+            "time_score":    1.0 if all_time else 0.0,
+            "recommendation": rec,
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +750,10 @@ def run(
         exclude_files=[],
     )
 
-    kpi_alignments = _compute_kpi_alignments(file_names, col_map, kpi_referenced, kpi_label_map)
+    kpi_alignments = _compute_kpi_alignments(
+        file_names, col_map, kpi_referenced, kpi_label_map, kpi_result
+    )
+    wb_kpi_stats = _compute_workbook_kpi_stats(file_names, kpi_result, config)
 
     intelligence_result = ConsolidationIntelligenceResult(
         file_profiles=file_profiles,
@@ -606,6 +763,7 @@ def run(
         final_recommendation=final_rec,
         visual_map=visual_map,
         kpi_alignments=kpi_alignments,
+        workbook_kpi_stats=wb_kpi_stats,
     )
 
     # ── Phase B: Strategy ──────────────────────────────────────────────────

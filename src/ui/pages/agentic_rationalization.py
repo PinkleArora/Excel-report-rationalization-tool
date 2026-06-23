@@ -449,10 +449,19 @@ def _render_step_2() -> None:
 
     if step == 2:
         if st.button("✅ Confirm Source Tabs & Continue", type="primary", key="ar_btn_confirm_discovery"):
-            # Run consolidation now so step 3 has data immediately
+            kpi_result_obj = None
+            with st.spinner("Running KPI Analysis…"):
+                try:
+                    kpi_result_obj = run_kpi_phase(bundles, config)
+                    st.session_state[_SS_KPI] = kpi_result_obj
+                except Exception as exc:
+                    st.error(f"KPI analysis failed: `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc(), language="python")
+                    return
             with st.spinner("Running Consolidation Intelligence…"):
                 try:
-                    consol = run_consolidation_phase(bundles, config)
+                    kpi_analysis = kpi_result_obj.output if kpi_result_obj else None
+                    consol = run_consolidation_phase(bundles, config, kpi_result=kpi_analysis)
                     st.session_state[_SS_CONSOLIDATION] = consol
                 except Exception as exc:
                     st.error(f"Consolidation analysis failed: `{type(exc).__name__}: {exc}`")
@@ -572,6 +581,30 @@ def _build_group_analysis_xlsx(intel) -> bytes:
     return buf.getvalue()
 
 
+def _build_compatibility_matrix_xlsx(intel) -> bytes:
+    """Compatibility Matrix: file × group with 5-dimension scores."""
+    from src.agentic_rationalization.agents.consolidation_agent import compute_file_group_compatibility
+    rows = []
+    for fp in intel.file_profiles:
+        compat = compute_file_group_compatibility(fp.file_name, intel.groups, intel.pairwise_scores)
+        for gid, scores in sorted(compat.items()):
+            rows.append({
+                "File":            fp.file_name,
+                "Group":           f"Group {gid}",
+                "Grain Score":     f"{scores['grain_score']:.0%}",
+                "KPI Score":       f"{scores['kpi_score']:.0%}",
+                "Schema Score":    f"{scores['schema_score']:.0%}",
+                "Key Score":       f"{scores['key_score']:.0%}",
+                "Time Score":      f"{scores['time_score']:.0%}",
+                "Overall Score":   f"{scores['overall_score']:.0%}",
+                "Recommendation":  scores["recommendation"],
+            })
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, sheet_name="Compatibility Matrix")
+    return buf.getvalue()
+
+
 def _apply_group_overrides(groups, overrides: dict) -> list:
     """Return modified groups list after applying manual overrides."""
     if not overrides:
@@ -627,12 +660,15 @@ def _apply_group_overrides(groups, overrides: dict) -> list:
 
 
 def _render_step_3() -> None:
+    from src.agentic_rationalization.agents.consolidation_agent import compute_file_group_compatibility
+
     step = _current_step()
     if step < 3:
         return
 
     st.subheader("Step 3 — Consolidation Workspace")
 
+    config = st.session_state.get(_SS_CONFIG)
     consol_result: AgentResult | None = st.session_state.get(_SS_CONSOLIDATION)
 
     if consol_result is None or consol_result.output is None:
@@ -646,9 +682,12 @@ def _render_step_3() -> None:
 
     group_overrides: dict = st.session_state.get(_SS_GROUP_OVERRIDES, {})
     effective_groups = _apply_group_overrides(intel.groups, group_overrides)
+    file_names = [fp.file_name for fp in intel.file_profiles]
 
-    tab_profiles, tab_groups, tab_pairwise, tab_kpi, tab_overrides = st.tabs([
+    (tab_profiles, tab_kpi_disc, tab_groups, tab_pairwise,
+     tab_kpi_align, tab_overrides) = st.tabs([
         "File Profiles",
+        "KPI Discovery",
         "Consolidation Groups",
         "5-Dimension Scores",
         "KPI Alignment",
@@ -658,12 +697,18 @@ def _render_step_3() -> None:
     # ── Tab 1: File Profiles ──────────────────────────────────────────────────
     with tab_profiles:
         if intel.file_profiles:
+            # Build per-workbook KPI tab list from workbook_kpi_stats
+            kpi_tabs_by_file: dict[str, str] = {}
+            for wks in getattr(intel, "workbook_kpi_stats", []):
+                kpi_tabs_by_file[wks.workbook_name] = ", ".join(wks.kpi_tabs) if wks.kpi_tabs else "—"
+
             rows = []
             for fp in intel.file_profiles:
                 pk_str = ", ".join(fp.primary_key_candidates) if fp.primary_key_candidates else "—"
                 rows.append({
                     "File":              fp.file_name,
                     "Source Tab":        fp.source_tab,
+                    "KPI Tabs":          kpi_tabs_by_file.get(fp.file_name, "—"),
                     "Rows":              fp.row_count,
                     "Total Columns":     fp.column_count,
                     "Distinct Columns":  fp.distinct_columns,
@@ -678,7 +723,42 @@ def _render_step_3() -> None:
         else:
             st.info("No file profiles available.")
 
-    # ── Tab 2: Consolidation Groups ───────────────────────────────────────────
+    # ── Tab 2: KPI Discovery ─────────────────────────────────────────────────
+    with tab_kpi_disc:
+        wb_kpi_stats = getattr(intel, "workbook_kpi_stats", [])
+        if not wb_kpi_stats:
+            st.info("KPI Discovery data not available — re-run from Step 2.")
+        else:
+            for wks in wb_kpi_stats:
+                conf_icon = _conf_color(wks.detection_confidence)
+                with st.expander(
+                    f"{conf_icon} **{wks.workbook_name}** — "
+                    f"{wks.kpi_column_count} KPI column(s), "
+                    f"{wks.formula_count} formula(s)",
+                    expanded=True,
+                ):
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("KPI Tabs Found", len(wks.kpi_tabs))
+                    c2.metric("KPI Formulas", wks.formula_count)
+                    c3.metric("KPI Columns", wks.kpi_column_count)
+                    c4.metric("Detection Confidence", f"{wks.detection_confidence:.0%}")
+                    if wks.kpi_tabs:
+                        st.markdown(
+                            "**KPI Tabs Identified:** " +
+                            " · ".join(f"`{t}`" for t in wks.kpi_tabs)
+                        )
+                    if wks.reason_if_empty:
+                        st.warning(f"**Why no KPIs detected:** {wks.reason_if_empty}")
+                        st.markdown(
+                            "**Troubleshooting:**\n"
+                            "1. Verify the correct KPI tab is selected in Step 1.\n"
+                            "2. Check that KPI formulas reference source-data columns "
+                            "(e.g. `=SUMIFS(SQL_data!D:D, SQL_data!B:B, A1)`).\n"
+                            "3. Formulas that only reference other KPI-tab cells are "
+                            "classified as DERIVED and may not resolve to source columns."
+                        )
+
+    # ── Tab 3: Consolidation Groups ───────────────────────────────────────────
     with tab_groups:
         if not effective_groups:
             st.info("No groups detected.")
@@ -695,23 +775,23 @@ def _render_step_3() -> None:
                     st.caption(group.reasoning)
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Common Columns", group.common_column_count)
-                    c2.metric("Total Union", group.unique_column_count)
+                    c2.metric("Total Union Cols", group.unique_column_count)
                     c3.metric("KPI Required", group.kpi_required_column_count)
                     c4.metric("Discardable", group.discardable_column_count)
 
-                    # Per-file contribution breakdown
                     contributions = getattr(group, "file_contributions", [])
                     if contributions:
                         st.markdown("**Per-File Contribution Breakdown**")
                         contrib_rows = []
                         for fc in contributions:
                             contrib_rows.append({
-                                "File":                  fc.file_name,
-                                "Total Cols":            fc.total_columns,
-                                "KPI Cols":              fc.kpi_columns,
-                                "Common Contributed":    fc.common_columns_contributed,
-                                "Unique Contributed":    fc.unique_columns_contributed,
-                                "Discardable":           fc.discardable_columns,
+                                "File":                   fc.file_name,
+                                "Total Cols":             fc.total_columns,
+                                "KPI Cols":               fc.kpi_columns,
+                                "Key/Grain Cols":         fc.key_columns,
+                                "Common Contributed":     fc.common_columns_contributed,
+                                "Unique Contributed":     fc.unique_columns_contributed,
+                                "Discardable":            fc.discardable_columns,
                             })
                         st.dataframe(
                             pd.DataFrame(contrib_rows),
@@ -722,7 +802,6 @@ def _render_step_3() -> None:
                         for fname in group.file_names:
                             st.markdown(f"- `{fname}`")
 
-                    # Why Can't Combine — for standalone files
                     detail = getattr(group, "incompatibility_detail", "")
                     if group.recommendation == "Keep Separate" and detail:
                         with st.expander("Why can't this file be combined?", expanded=False):
@@ -734,72 +813,83 @@ def _render_step_3() -> None:
         else:
             st.info(f"**{fr.summary}**  {fr.business_reasoning}")
 
-        # Download buttons
         st.markdown("---")
         st.markdown("**Download Analysis**")
-        dl1, dl2, dl3, dl4 = st.columns(4)
+        dl1, dl2, dl3, dl4, dl5 = st.columns(5)
         with dl1:
             try:
-                xlsx = _build_column_mapping_xlsx(intel)
                 st.download_button(
-                    "Column Mapping.xlsx", data=xlsx,
+                    "Column Mapping.xlsx", data=_build_column_mapping_xlsx(intel),
                     file_name="Column_Mapping.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_col_map",
                 )
             except Exception as e:
-                st.caption(f"Column mapping unavailable: {e}")
+                st.caption(f"Unavailable: {e}")
         with dl2:
             try:
-                xlsx = _build_kpi_mapping_xlsx(intel)
                 st.download_button(
-                    "KPI Mapping.xlsx", data=xlsx,
+                    "KPI Mapping.xlsx", data=_build_kpi_mapping_xlsx(intel),
                     file_name="KPI_Mapping.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_kpi_map",
                 )
             except Exception as e:
-                st.caption(f"KPI mapping unavailable: {e}")
+                st.caption(f"Unavailable: {e}")
         with dl3:
             try:
-                xlsx = _build_consolidation_assessment_xlsx(intel)
                 st.download_button(
-                    "Consolidation Assessment.xlsx", data=xlsx,
+                    "Consolidation Assessment.xlsx",
+                    data=_build_consolidation_assessment_xlsx(intel),
                     file_name="Consolidation_Assessment.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_consol_assess",
                 )
             except Exception as e:
-                st.caption(f"Assessment unavailable: {e}")
+                st.caption(f"Unavailable: {e}")
         with dl4:
             try:
-                xlsx = _build_group_analysis_xlsx(intel)
                 st.download_button(
-                    "Group Analysis.xlsx", data=xlsx,
+                    "Group Analysis.xlsx", data=_build_group_analysis_xlsx(intel),
                     file_name="Group_Analysis.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_group_analysis",
                 )
             except Exception as e:
-                st.caption(f"Group analysis unavailable: {e}")
+                st.caption(f"Unavailable: {e}")
+        with dl5:
+            try:
+                st.download_button(
+                    "Compatibility Matrix.xlsx",
+                    data=_build_compatibility_matrix_xlsx(intel),
+                    file_name="Compatibility_Matrix.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_compat_matrix",
+                )
+            except Exception as e:
+                st.caption(f"Unavailable: {e}")
 
-    # ── Tab 3: 5-Dimension Scores ─────────────────────────────────────────────
+    # ── Tab 4: 5-Dimension Scores ─────────────────────────────────────────────
     with tab_pairwise:
         if not intel.pairwise_scores:
-            st.info("No pairwise scores available (single file or no comparison possible).")
+            st.info("No pairwise scores (single file or no comparison possible).")
         else:
             for sc in intel.pairwise_scores:
-                with st.expander(f"`{sc.file_a}` vs `{sc.file_b}` — {sc.recommendation}", expanded=False):
+                with st.expander(
+                    f"`{sc.file_a}` vs `{sc.file_b}` — {sc.recommendation}",
+                    expanded=False,
+                ):
                     g1, g2, g3, g4, g5, g6 = st.columns(6)
-                    g1.metric("Grain", "✓ Compatible" if sc.grain_compatible else "✗ Mismatch")
+                    g1.metric("Grain Compatibility", "✓" if sc.grain_compatible else "✗ Mismatch")
                     g2.metric("Schema Similarity", f"{sc.schema_overlap_pct:.0%}")
                     g3.metric("KPI Similarity", f"{sc.kpi_overlap_pct:.0%}")
                     g4.metric("Key Compatible", "Yes" if sc.key_compatible else "No")
                     g5.metric("Time Dimension", "Match" if sc.time_dimension_compatible else "Mismatch")
                     g6.metric("Overall Score", f"{sc.overall_score:.0%}")
 
-                    rec_color = "green" if sc.recommendation == "Consolidate" else (
-                        "orange" if sc.recommendation == "Conditionally Consolidate" else "red"
+                    rec_color = (
+                        "green" if sc.recommendation == "Consolidate"
+                        else ("orange" if sc.recommendation == "Conditionally Consolidate" else "red")
                     )
                     st.markdown(
                         f"**Recommendation:** :{rec_color}[{sc.recommendation}]  "
@@ -807,37 +897,52 @@ def _render_step_3() -> None:
                     )
                     st.caption(sc.reasoning)
 
-                    # Detailed incompatibility
                     if not sc.grain_compatible:
                         st.markdown(
                             f"> **Grain mismatch**: `{sc.file_a}` is *{sc.grain_a}*-level while "
                             f"`{sc.file_b}` is *{sc.grain_b}*-level. "
-                            f"Combining would produce misleading aggregations — for example, "
-                            f"summing a {sc.grain_b}-level amount column into a {sc.grain_a}-level "
-                            f"report would overcounts rows."
+                            f"{sc.grain_a.title()}-level records cannot be directly merged with "
+                            f"{sc.grain_b.title()}-level records without aggregation — doing so "
+                            f"would produce incorrect totals."
+                        )
+                    elif sc.overall_score < 0.50:
+                        st.markdown(
+                            f"> **Low compatibility** (score {sc.overall_score:.0%}): Files are "
+                            f"grain-compatible but have insufficient KPI/schema overlap to justify "
+                            f"consolidation. They likely support different reporting objectives."
                         )
 
-    # ── Tab 4: KPI Alignment ──────────────────────────────────────────────────
-    with tab_kpi:
+    # ── Tab 5: KPI Alignment ─────────────────────────────────────────────────
+    with tab_kpi_align:
         kpi_alignments = getattr(intel, "kpi_alignments", [])
-        if not kpi_alignments:
-            st.info("No KPI columns identified. Run KPI analysis first or upload files with KPI definitions.")
-        else:
-            kpi_decisions: dict = st.session_state.get(_SS_KPI_ALIGN_DECISIONS, {})
-            file_names = [fp.file_name for fp in intel.file_profiles]
+        kpi_decisions: dict = st.session_state.get(_SS_KPI_ALIGN_DECISIONS, {})
 
+        if not kpi_alignments:
+            st.warning(
+                "No KPI columns identified. This usually means KPI analysis was not run before "
+                "consolidation, or no KPI formulas reference source-data columns."
+            )
+            st.markdown(
+                "**Troubleshooting:**\n"
+                "1. Return to Step 1 and verify KPI tabs are correctly identified.\n"
+                "2. Check the **KPI Discovery** tab for per-workbook detection details.\n"
+                "3. Ensure KPI formulas reference the source tab "
+                "(e.g. `=SUMIFS(SQL_data!D:D,SQL_data!B:B,A1)`)."
+            )
+        else:
             partial = [a for a in kpi_alignments if a.status == "partial"]
             aligned = [a for a in kpi_alignments if a.status == "aligned"]
             missing = [a for a in kpi_alignments if a.status == "missing"]
 
-            st.markdown(
-                f"**{len(aligned)} fully aligned** | "
-                f"**{len(partial)} partially aligned** | "
-                f"**{len(missing)} missing**"
-            )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Fully Aligned", len(aligned), help="KPI column present in all files")
+            m2.metric("Partially Aligned", len(partial), help="KPI column present in some files only")
+            m3.metric("Missing", len(missing), help="KPI column not found in any file")
+
+            st.markdown("---")
 
             if partial:
-                st.markdown("**Partially Aligned KPIs — Review & Accept/Reject Fuzzy Matches**")
+                st.markdown("**Partially Aligned KPIs — Review suggested matches**")
                 for aln in partial:
                     dec = kpi_decisions.get(aln.canonical_kpi, "pending")
                     status_icon = {"accepted": "✅", "rejected": "❌", "pending": "❓"}.get(dec, "❓")
@@ -846,54 +951,126 @@ def _render_step_3() -> None:
                         expanded=(dec == "pending"),
                     ):
                         if aln.kpi_labels:
-                            st.caption(f"KPI label(s): {', '.join(aln.kpi_labels)}")
+                            st.caption(f"KPI formula label(s): {', '.join(aln.kpi_labels)}")
+
                         match_rows = []
                         for fn in file_names:
                             raw = aln.per_file_match.get(fn, "")
                             conf = aln.per_file_confidence.get(fn, 0.0)
+                            if conf == 1.0:
+                                match_type = "Exact"
+                            elif conf >= 0.90:
+                                match_type = "Column match"
+                            elif raw:
+                                match_type = f"Fuzzy ({conf:.0%})"
+                            else:
+                                match_type = "—"
+                            rec = "Match" if conf >= 0.90 else ("Possible Match" if conf >= 0.70 else "Review")
                             match_rows.append({
-                                "File":          fn,
-                                "Matched Column": raw if raw else "(not found)",
-                                "Match Type":    "Exact" if conf == 1.0 else (f"Fuzzy ({conf:.0%})" if raw else "—"),
+                                "Source Workbook":  fn,
+                                "Canonical KPI":    aln.canonical_kpi,
+                                "Source KPI Name":  ", ".join(aln.kpi_labels) if aln.kpi_labels else aln.canonical_kpi,
+                                "Mapped Column":    raw if raw else "(not found)",
+                                "Confidence":       f"{conf:.0%}" if raw else "—",
+                                "Match Type":       match_type,
+                                "Recommendation":   rec if raw else "No match",
                             })
                         st.dataframe(pd.DataFrame(match_rows), use_container_width=True, hide_index=True)
 
-                        ba, br = st.columns(2)
+                        ba, br, bm_col = st.columns([1, 1, 2])
                         with ba:
-                            if st.button("Accept Matches", key=f"kpi_accept_{aln.canonical_kpi}"):
+                            if st.button("✅ Accept Mapping", key=f"kpi_accept_{aln.canonical_kpi}"):
                                 kpi_decisions[aln.canonical_kpi] = "accepted"
                                 st.session_state[_SS_KPI_ALIGN_DECISIONS] = kpi_decisions
                                 st.rerun()
                         with br:
-                            if st.button("Reject Matches", key=f"kpi_reject_{aln.canonical_kpi}"):
+                            if st.button("❌ Reject Mapping", key=f"kpi_reject_{aln.canonical_kpi}"):
                                 kpi_decisions[aln.canonical_kpi] = "rejected"
+                                st.session_state[_SS_KPI_ALIGN_DECISIONS] = kpi_decisions
+                                st.rerun()
+                        with bm_col:
+                            manual_val = st.text_input(
+                                "Manual map to canonical:",
+                                key=f"kpi_manual_{aln.canonical_kpi}",
+                                placeholder="e.g. gross_reserve",
+                                label_visibility="collapsed",
+                            )
+                            if manual_val and st.button("Apply Manual", key=f"kpi_mapply_{aln.canonical_kpi}"):
+                                kpi_decisions[aln.canonical_kpi] = f"manual:{manual_val}"
                                 st.session_state[_SS_KPI_ALIGN_DECISIONS] = kpi_decisions
                                 st.rerun()
 
             if aligned:
-                with st.expander(f"Fully Aligned KPI Columns ({len(aligned)})", expanded=False):
-                    aligned_rows = [{"Canonical": a.canonical_kpi, "KPI Label(s)": ", ".join(a.kpi_labels)} for a in aligned]
+                with st.expander(f"✅ Fully Aligned KPI Columns ({len(aligned)})", expanded=False):
+                    aligned_rows = []
+                    for a in aligned:
+                        row = {
+                            "Canonical KPI": a.canonical_kpi,
+                            "KPI Label(s)":  ", ".join(a.kpi_labels),
+                        }
+                        for fn in file_names:
+                            row[fn] = a.per_file_match.get(fn, "")
+                        aligned_rows.append(row)
                     st.dataframe(pd.DataFrame(aligned_rows), use_container_width=True, hide_index=True)
 
             if missing:
-                with st.expander(f"Missing KPI Columns ({len(missing)})", expanded=False):
-                    st.caption("These KPI columns were not found in any source file.")
-                    missing_rows = [{"Canonical": a.canonical_kpi, "KPI Label(s)": ", ".join(a.kpi_labels)} for a in missing]
-                    st.dataframe(pd.DataFrame(missing_rows), use_container_width=True, hide_index=True)
+                with st.expander(f"⚠️ Missing KPI Columns ({len(missing)})", expanded=False):
+                    st.caption("Not found in any source file.")
+                    st.dataframe(
+                        pd.DataFrame([{"Canonical": a.canonical_kpi, "KPI Label(s)": ", ".join(a.kpi_labels)} for a in missing]),
+                        use_container_width=True, hide_index=True,
+                    )
 
-    # ── Tab 5: Manual Group Overrides ────────────────────────────────────────
+    # ── Tab 6: Manual Group Overrides ────────────────────────────────────────
     with tab_overrides:
+        st.markdown("**File-to-Group Compatibility Matrix**")
+        st.caption("Shows how compatible each file would be if moved to each group.")
+
+        matrix_rows = []
+        for fp in intel.file_profiles:
+            compat = compute_file_group_compatibility(
+                fp.file_name, intel.groups, intel.pairwise_scores
+            )
+            current_gid = next(
+                (g.group_id for g in intel.groups if fp.file_name in g.file_names), None
+            )
+            best_gid, best_score = None, -1.0
+            row: dict = {"File": fp.file_name, "Current Group": f"Group {current_gid}" if current_gid else "—"}
+            for gid, scores in sorted(compat.items()):
+                row[f"Grp {gid} Score"] = f"{scores['overall_score']:.0%}"
+                if scores["overall_score"] > best_score:
+                    best_score, best_gid = scores["overall_score"], gid
+            row["Recommended"] = f"Group {best_gid}" if best_gid else "—"
+            matrix_rows.append(row)
+        if matrix_rows:
+            st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("**Per-File Decision Support**")
+        for fp in intel.file_profiles:
+            compat = compute_file_group_compatibility(
+                fp.file_name, intel.groups, intel.pairwise_scores
+            )
+            with st.expander(f"📊 `{fp.file_name}`", expanded=False):
+                for gid, scores in sorted(compat.items()):
+                    st.markdown(f"**Group {gid}:** Overall {scores['overall_score']:.0%} → {scores['recommendation']}")
+                    dc1, dc2, dc3, dc4, dc5 = st.columns(5)
+                    dc1.metric("Grain", f"{scores['grain_score']:.0%}")
+                    dc2.metric("KPI Sim", f"{scores['kpi_score']:.0%}")
+                    dc3.metric("Schema", f"{scores['schema_score']:.0%}")
+                    dc4.metric("Key", f"{scores['key_score']:.0%}")
+                    dc5.metric("Time", f"{scores['time_score']:.0%}")
+
+        st.markdown("---")
         st.markdown(
-            "Use these controls to move files between groups, exclude files, "
-            "or create new groups. Click **Apply Overrides** to update the workspace."
+            "**Move files between groups, exclude files, or create new groups.**  "
+            "Click **Apply Overrides** when done."
         )
 
         group_overrides = st.session_state.get(_SS_GROUP_OVERRIDES, {})
-        file_names = [fp.file_name for fp in intel.file_profiles]
         group_ids   = sorted({g.group_id for g in intel.groups})
         max_group_id = max(group_ids) if group_ids else 0
 
-        override_changed = False
         for fname in file_names:
             current_group = next(
                 (g.group_id for g in intel.groups if fname in g.file_names), 0
@@ -907,7 +1084,8 @@ def _render_step_3() -> None:
             with fc2:
                 options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_group_id + 1}"]
                 options_ids    = group_ids + [max_group_id + 1]
-                current_idx = options_ids.index(override_val) if (override_val in options_ids) else 0
+                safe_val = override_val if override_val in options_ids else current_group
+                current_idx = options_ids.index(safe_val) if safe_val in options_ids else 0
                 chosen_label = st.selectbox(
                     "Move to group:",
                     options_labels,
@@ -916,16 +1094,10 @@ def _render_step_3() -> None:
                     label_visibility="collapsed",
                 )
                 new_gid = options_ids[options_labels.index(chosen_label)]
-                if new_gid != current_group or new_gid != override_val:
-                    group_overrides[fname] = new_gid
-                    override_changed = True
+                group_overrides[fname] = new_gid
             with fc3:
                 if st.checkbox("Exclude", value=exclude_now, key=f"grp_exclude_{fname}"):
                     group_overrides[fname] = None
-                    override_changed = True
-                elif fname in group_overrides and group_overrides[fname] is None:
-                    group_overrides[fname] = current_group
-                    override_changed = True
 
         col_apply, col_reset = st.columns(2)
         with col_apply:
@@ -943,7 +1115,6 @@ def _render_step_3() -> None:
 
     if step == 3:
         if st.button("✅ Confirm Groups & Continue", type="primary", key="ar_btn_confirm_consol"):
-            # Store effective groups in session state so step 4 uses them
             if group_overrides:
                 st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
             _set_step(4)
