@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -51,6 +52,11 @@ _AGGREGATE_FUNCS = frozenset({
     "VLOOKUP", "HLOOKUP", "INDEX", "MATCH",
     "PIVOT", "GETPIVOTDATA",
 })
+# Pre-compiled regex — much faster than 18 string constructions per formula cell
+_AGG_FUNC_RE = re.compile(
+    r"(?:^|[=,(])(" + "|".join(_AGGREGATE_FUNCS) + r")\s*\(",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -282,17 +288,33 @@ def analyze_many(
     bundles: list,
     config: ClassificationConfig | None = None,
 ) -> list[WorkbookAnalysis]:
-    """Analyse multiple bundles, skipping failures with a warning."""
-    results = []
-    for bundle in bundles:
-        try:
-            results.append(analyze_workbook(bundle, config=config))
-        except Exception as exc:
-            logger.warning(
-                "Could not analyse '%s': %s",
-                getattr(bundle, "file_name", "?"), exc,
-            )
-    return results
+    """Analyse multiple bundles in parallel, skipping failures with a warning.
+
+    Uses a ThreadPoolExecutor so multiple workbooks are analysed concurrently.
+    Results are returned in the same order as the input bundles.
+    """
+    if not bundles:
+        return []
+
+    results: list[WorkbookAnalysis | None] = [None] * len(bundles)
+
+    def _analyse(idx: int, bundle) -> tuple[int, WorkbookAnalysis]:
+        return idx, analyze_workbook(bundle, config=config)
+
+    with ThreadPoolExecutor(max_workers=min(len(bundles), 8)) as pool:
+        futures = {pool.submit(_analyse, i, b): i for i, b in enumerate(bundles)}
+        for future in as_completed(futures):
+            try:
+                idx, analysis = future.result()
+                results[idx] = analysis
+            except Exception as exc:
+                bundle = bundles[futures[future]]
+                logger.warning(
+                    "Could not analyse '%s': %s",
+                    getattr(bundle, "file_name", "?"), exc,
+                )
+
+    return [r for r in results if r is not None]
 
 
 def build_kpi_inventory_df(analyses: list[WorkbookAnalysis]) -> pd.DataFrame:
@@ -502,13 +524,21 @@ def _extract_signals(raw_ws: Any, df: pd.DataFrame, max_scan_rows: int = 500) ->
 _LARGE_SHEET_ROW_THRESHOLD = 500  # sheets with more rows use sampled scan
 
 
+_PANDAS_SAMPLE_ROWS = 5_000  # cap for nunique / dtype scans
+
+
 def _compute_avg_unique_ratio(df: pd.DataFrame) -> float:
-    """Mean of (unique_values / total_values) across all non-empty columns."""
+    """Mean of (unique_values / total_values) across all non-empty columns.
+
+    Sampled to at most _PANDAS_SAMPLE_ROWS rows so large source tabs don't
+    dominate discovery time; uniqueness ratios are stable with small samples.
+    """
     if df.empty or len(df.columns) == 0:
         return 0.0
+    sample = df if len(df) <= _PANDAS_SAMPLE_ROWS else df.iloc[:_PANDAS_SAMPLE_ROWS]
     ratios = []
-    for col in df.columns:
-        series = df[col].dropna()
+    for col in sample.columns:
+        series = sample[col].dropna()
         if len(series) > 0:
             ratios.append(series.nunique() / len(series))
     return sum(ratios) / len(ratios) if ratios else 0.0
@@ -518,17 +548,17 @@ def _compute_dtype_homogeneity(df: pd.DataFrame) -> float:
     """Fraction of columns sharing the single most common inferred dtype."""
     if df.empty or len(df.columns) == 0:
         return 0.0
+    # dtypes are column-level metadata — no row scan needed
     dtype_counts: dict[str, int] = {}
-    for col in df.columns:
-        dtype_counts[str(df[col].dtype)] = dtype_counts.get(str(df[col].dtype), 0) + 1
+    for dtype in df.dtypes:
+        key = str(dtype)
+        dtype_counts[key] = dtype_counts.get(key, 0) + 1
     majority = max(dtype_counts.values())
     return majority / len(df.columns)
 
 
 def _has_aggregate_function(formula: str) -> bool:
-    upper = formula.upper()
-    return any(f"={fn}(" in upper or f",{fn}(" in upper or f"({fn}(" in upper
-               for fn in _AGGREGATE_FUNCS)
+    return bool(_AGG_FUNC_RE.search(formula))
 
 
 # ---------------------------------------------------------------------------
