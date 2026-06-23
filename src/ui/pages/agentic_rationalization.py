@@ -403,6 +403,158 @@ def _render_validation_summary(pipeline: PipelineResult) -> None:
                 st.warning(w)
 
 
+def _render_consolidation_intelligence(pipeline: PipelineResult) -> None:
+    """Render the Consolidation Intelligence results section."""
+    from src.agentic_rationalization.agents.consolidation_intelligence_agent import (
+        ConsolidationIntelligenceResult,
+        ConsolidationGroup,
+        FileProfile,
+    )
+
+    ci_result_obj = pipeline.get_result("ConsolidationIntelligenceAgent")
+    if ci_result_obj is None:
+        return
+    
+    if ci_result_obj.warnings:
+        for w in ci_result_obj.warnings:
+            st.warning(w)
+    
+    result = ci_result_obj.output
+    if result is None:
+        st.warning("Consolidation Intelligence analysis did not produce results.")
+        return
+
+    st.subheader("Consolidation Intelligence")
+    st.caption(
+        "Inferred data grain, compatibility scores, and grouping recommendations "
+        "for all uploaded files."
+    )
+
+    # Final recommendation banner
+    fr = result.final_recommendation
+    if fr.consolidate_files:
+        st.success(f"**{fr.summary}**")
+    else:
+        st.info(f"**{fr.summary}**")
+    st.caption(fr.business_reasoning)
+
+    tab_profiles, tab_groups, tab_pairs, tab_discard, tab_map = st.tabs([
+        "File Profiles",
+        "Consolidation Groups",
+        "Pairwise Compatibility",
+        "Discard Analysis",
+        "Consolidation Map",
+    ])
+
+    with tab_profiles:
+        if result.file_profiles:
+            rows = []
+            for fp in result.file_profiles:
+                rows.append({
+                    "File": fp.file_name,
+                    "Rows": fp.row_count,
+                    "Columns": fp.column_count,
+                    "Distinct Cols": fp.distinct_columns,
+                    "Inferred Grain": fp.inferred_grain,
+                    "Grain Confidence": f"{fp.grain_confidence:.0%}",
+                    "Source Tab": fp.source_tab,
+                    "KPI Cols": fp.kpi_referenced_column_count,
+                    "Non-KPI Cols": fp.non_kpi_column_count,
+                    "PK Candidates": ", ".join(fp.primary_key_candidates[:3]),
+                    "Has Time Dim": "Yes" if fp.has_time_dimension else "No",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No file profiles available.")
+
+    with tab_groups:
+        if result.groups:
+            for group in result.groups:
+                icon = "🟢" if group.recommendation == "Consolidate" else "🟡"
+                with st.expander(
+                    f"{icon} Group {group.group_id}: {group.group_label} "
+                    f"({len(group.file_names)} file(s))",
+                    expanded=len(result.groups) <= 3,
+                ):
+                    st.caption(group.reasoning)
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Common Columns", group.common_column_count)
+                    col2.metric("Total Unique Cols", group.unique_column_count)
+                    col3.metric("KPI-Required", group.kpi_required_column_count)
+                    col4.metric("Discardable", group.discardable_column_count)
+                    st.markdown("**Files in group:**")
+                    for fname in group.file_names:
+                        st.markdown(f"- `{fname}`")
+                    if group.recommendation == "Consolidate":
+                        st.success(f"Recommendation: **{group.recommendation}** — expected master: {group.expected_master_columns} columns")
+                    else:
+                        st.warning(f"Recommendation: **{group.recommendation}**")
+        else:
+            st.info("No groups available.")
+
+    with tab_pairs:
+        if result.pairwise_scores:
+            rows = []
+            for sc in result.pairwise_scores:
+                rows.append({
+                    "File A": sc.file_a,
+                    "File B": sc.file_b,
+                    "Schema Overlap": f"{sc.schema_overlap_pct:.1%}",
+                    "KPI Overlap": f"{sc.kpi_overlap_pct:.1%}",
+                    "Grain Compatible": "Yes" if sc.grain_compatible else "No",
+                    "Grain A": sc.grain_a,
+                    "Grain B": sc.grain_b,
+                    "Key Compatible": "Yes" if sc.key_compatible else "No",
+                    "Time Dim Compatible": "Yes" if sc.time_dimension_compatible else "No",
+                    "Overall Score": f"{sc.overall_score:.2f}",
+                    "Recommendation": sc.recommendation,
+                    "Confidence": f"{sc.recommendation_confidence:.0%}",
+                })
+            df_pairs = pd.DataFrame(rows)
+            st.dataframe(df_pairs, use_container_width=True, hide_index=True)
+        else:
+            st.info("No pairwise comparisons available (need 2+ files).")
+
+    with tab_discard:
+        da = result.discard_analysis
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Columns", da.total_original_columns)
+        c2.metric("KPI-Used", da.kpi_used_columns)
+        c3.metric("Non-KPI", da.non_kpi_columns)
+        c4.metric("Reduction Potential", f"{da.potential_reduction_pct:.1f}%")
+
+        if da.column_recs:
+            rows = []
+            for rec in da.column_recs:
+                rows.append({
+                    "Column": rec.canonical_name,
+                    "Used by KPI": "Yes" if rec.used_by_kpi else "No",
+                    "KPI Names": ", ".join(rec.kpi_names[:3]),
+                    "Recommendation": rec.recommendation,
+                    "Confidence": rec.confidence,
+                    "Reason": rec.reason_retained,
+                })
+            df_disc = pd.DataFrame(rows)
+            search_term = st.text_input("Search columns:", key="ci_col_search", placeholder="Filter by column name...")
+            if search_term:
+                df_disc = df_disc[df_disc["Column"].str.contains(search_term, case=False, na=False)]
+            st.dataframe(df_disc, use_container_width=True, hide_index=True)
+
+    with tab_map:
+        if fr.consolidate_files:
+            for fname in fr.consolidate_files:
+                st.success(f"Consolidate: `{fname}`")
+        if fr.separate_model_files:
+            for fname in fr.separate_model_files:
+                st.info(f"Separate model: `{fname}`")
+        if fr.exclude_files:
+            for fname in fr.exclude_files:
+                st.warning(f"Exclude: `{fname}`")
+        if result.visual_map:
+            with st.expander("Consolidation Map (ASCII)", expanded=True):
+                st.code(result.visual_map, language=None)
+
+
 # ── Main review panel ─────────────────────────────────────────────────────────
 
 def _render_review_panel(pipeline: PipelineResult) -> None:
@@ -622,6 +774,8 @@ def render() -> None:
         _render_agent_card(agent_result)
 
     _render_validation_summary(pipeline)
+
+    _render_consolidation_intelligence(pipeline)
 
     # ── Step 4: Structured Review ─────────────────────────────────────────────
     _render_review_panel(pipeline)
