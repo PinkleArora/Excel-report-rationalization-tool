@@ -1313,8 +1313,20 @@ def _render_step_5() -> None:
         st.info("Schema analysis did not produce results.")
         return
 
+    # Defensive contract check — SourceAnalysisResult must have column_profiles
+    if not hasattr(source_analysis, "column_profiles"):
+        actual = [a for a in dir(source_analysis) if not a.startswith("_")]
+        st.error(
+            "**Schema Rationalization cannot start.**\n\n"
+            f"Missing: `SourceAnalysisResult.column_profiles`\n\n"
+            f"Expected: Column profile collection\n\n"
+            f"Actual attributes: `{actual}`\n\n"
+            "Agent producing this object: **SchemaAgent** — check `run_schema_phase` output."
+        )
+        return
+
     # Schema Dashboard
-    all_profiles = source_analysis.all_columns
+    all_profiles = source_analysis.column_profiles
     common_count = len(source_analysis.common_columns)
     unique_count = len([p for p in all_profiles if p.match_class == "unique"])
     similar_count = len([p for p in all_profiles if p.match_class == "similar"])
