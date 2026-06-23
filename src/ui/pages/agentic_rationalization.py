@@ -1020,15 +1020,69 @@ def _render_step_3() -> None:
             partial = [a for a in kpi_alignments if a.status == "partial"]
             aligned = [a for a in kpi_alignments if a.status == "aligned"]
             missing = [a for a in kpi_alignments if a.status == "missing"]
+            all_canonicals = [a.canonical_kpi for a in kpi_alignments]
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Fully Aligned", len(aligned), help="KPI column present in all files")
-            m2.metric("Partially Aligned", len(partial), help="KPI column present in some files only")
-            m3.metric("Missing", len(missing), help="KPI column not found in any file")
+            # ── Summary counts ────────────────────────────────────────────────
+            n_accepted = sum(1 for c in all_canonicals if kpi_decisions.get(c, "pending") == "accepted")
+            n_rejected = sum(1 for c in all_canonicals if kpi_decisions.get(c, "pending") == "rejected")
+            n_pending  = sum(1 for c in all_canonicals if kpi_decisions.get(c, "pending") not in ("accepted", "rejected"))
+
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("Fully Aligned",      len(aligned), help="KPI column present in all files")
+            m2.metric("Partially Aligned",  len(partial), help="KPI column present in some files only")
+            m3.metric("Missing",            len(missing), help="KPI column not found in any file")
+            m4.metric("✅ Accepted",         n_accepted)
+            m5.metric("❌ Rejected",         n_rejected)
+            m6.metric("❓ Pending Review",   n_pending)
+
+            # ── Global bulk actions ───────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("**Bulk Actions**")
+            gc1, gc2, gc3 = st.columns(3)
+            with gc1:
+                if st.button("✅ Accept All Mappings", key="kpi_bulk_accept_all"):
+                    new = dict(kpi_decisions)
+                    for c in all_canonicals:
+                        new[c] = "accepted"
+                    st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                    st.rerun()
+            with gc2:
+                if st.button("❌ Reject All Mappings", key="kpi_bulk_reject_all"):
+                    new = dict(kpi_decisions)
+                    for c in all_canonicals:
+                        new[c] = "rejected"
+                    st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                    st.rerun()
+            with gc3:
+                if st.button("🔄 Reset All Decisions", key="kpi_bulk_reset_all"):
+                    new = {k: v for k, v in kpi_decisions.items() if k not in all_canonicals}
+                    st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                    st.rerun()
 
             st.markdown("---")
 
             if partial:
+                partial_canonicals = [a.canonical_kpi for a in partial]
+                pc1, pc2, pc3, _ = st.columns([1, 1, 1, 3])
+                with pc1:
+                    if st.button("✅ Accept Section", key="kpi_sec_accept_partial"):
+                        new = dict(kpi_decisions)
+                        for c in partial_canonicals:
+                            new[c] = "accepted"
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
+                with pc2:
+                    if st.button("❌ Reject Section", key="kpi_sec_reject_partial"):
+                        new = dict(kpi_decisions)
+                        for c in partial_canonicals:
+                            new[c] = "rejected"
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
+                with pc3:
+                    if st.button("🔄 Reset Section", key="kpi_sec_reset_partial"):
+                        new = {k: v for k, v in kpi_decisions.items() if k not in partial_canonicals}
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
                 st.markdown("**Partially Aligned KPIs — Review suggested matches**")
                 for aln in partial:
                     dec = kpi_decisions.get(aln.canonical_kpi, "pending")
@@ -1088,12 +1142,37 @@ def _render_step_3() -> None:
                                 st.rerun()
 
             if aligned:
+                aligned_canonicals = [a.canonical_kpi for a in aligned]
+                ac1, ac2, ac3, _ = st.columns([1, 1, 1, 3])
+                with ac1:
+                    if st.button("✅ Accept Section", key="kpi_sec_accept_aligned"):
+                        new = dict(kpi_decisions)
+                        for c in aligned_canonicals:
+                            new[c] = "accepted"
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
+                with ac2:
+                    if st.button("❌ Reject Section", key="kpi_sec_reject_aligned"):
+                        new = dict(kpi_decisions)
+                        for c in aligned_canonicals:
+                            new[c] = "rejected"
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
+                with ac3:
+                    if st.button("🔄 Reset Section", key="kpi_sec_reset_aligned"):
+                        new = {k: v for k, v in kpi_decisions.items() if k not in aligned_canonicals}
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
                 with st.expander(f"✅ Fully Aligned KPI Columns ({len(aligned)})", expanded=False):
                     aligned_rows = []
                     for a in aligned:
+                        dec = kpi_decisions.get(a.canonical_kpi, "pending")
+                        status_icon = {"accepted": "✅", "rejected": "❌", "pending": "❓"}.get(dec, "❓")
                         row = {
+                            "": status_icon,
                             "Canonical KPI": a.canonical_kpi,
                             "KPI Label(s)":  ", ".join(a.kpi_labels),
+                            "Decision":      dec,
                         }
                         for fn in file_names:
                             row[fn] = a.per_file_match.get(fn, "")
@@ -1101,6 +1180,27 @@ def _render_step_3() -> None:
                     st.dataframe(pd.DataFrame(aligned_rows), use_container_width=True, hide_index=True)
 
             if missing:
+                missing_canonicals = [a.canonical_kpi for a in missing]
+                mc1, mc2, mc3, _ = st.columns([1, 1, 1, 3])
+                with mc1:
+                    if st.button("✅ Accept Section", key="kpi_sec_accept_missing"):
+                        new = dict(kpi_decisions)
+                        for c in missing_canonicals:
+                            new[c] = "accepted"
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
+                with mc2:
+                    if st.button("❌ Reject Section", key="kpi_sec_reject_missing"):
+                        new = dict(kpi_decisions)
+                        for c in missing_canonicals:
+                            new[c] = "rejected"
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
+                with mc3:
+                    if st.button("🔄 Reset Section", key="kpi_sec_reset_missing"):
+                        new = {k: v for k, v in kpi_decisions.items() if k not in missing_canonicals}
+                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
+                        st.rerun()
                 with st.expander(f"⚠️ Missing KPI Columns ({len(missing)})", expanded=False):
                     st.caption("Not found in any source file.")
                     st.dataframe(
