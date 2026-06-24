@@ -926,16 +926,44 @@ def _apply_group_overrides(groups, overrides: dict) -> list:
     return result
 
 
-def _render_step_3() -> None:
-    from src.agentic_rationalization.agents.consolidation_agent import compute_file_group_compatibility
+def _kpis_for_group(group_files: list[str], kpi_alignments: list, max_show: int = 8) -> list[str]:
+    """KPI names present in ≥2 files of the group (or any file if single-file)."""
+    if not kpi_alignments:
+        return []
+    threshold = min(2, len(group_files))
+    result: list[str] = []
+    for aln in kpi_alignments:
+        matches = sum(1 for fn in group_files if aln.per_file_match.get(fn))
+        if matches >= threshold:
+            result.append(aln.canonical_kpi)
+        if len(result) >= max_show:
+            break
+    return result
 
+
+def _unique_kpis_for_file(fname: str, all_files: list[str], kpi_alignments: list, max_show: int = 8) -> list[str]:
+    """KPI names present only in *fname* and no other file."""
+    if not kpi_alignments:
+        return []
+    result: list[str] = []
+    for aln in kpi_alignments:
+        if not aln.per_file_match.get(fname):
+            continue
+        other_matches = sum(1 for fn in all_files if fn != fname and aln.per_file_match.get(fn))
+        if other_matches == 0:
+            result.append(aln.canonical_kpi)
+        if len(result) >= max_show:
+            break
+    return result
+
+
+def _render_step_3() -> None:
     step = _current_step()
     if step != 3:
         return
 
-    st.subheader("Step 3 — Consolidation Workspace")
+    st.subheader("Step 3 — Consolidation")
 
-    config = st.session_state.get(_SS_CONFIG)
     consol_result: AgentResult | None = st.session_state.get(_SS_CONSOLIDATION)
 
     if consol_result is None or consol_result.output is None:
@@ -947,9 +975,8 @@ def _render_step_3() -> None:
         st.info("No intelligence output available.")
         return
 
-    # Defensive validation
     _missing = _validate_pipeline_inputs(
-        "Step 3 — Consolidation Workspace",
+        "Step 3 — Consolidation",
         {
             "ConsolidationIntelligenceResult": (
                 intel,
@@ -958,634 +985,454 @@ def _render_step_3() -> None:
         },
     )
     if _missing:
-        _render_validation_error("Step 3 — Consolidation Workspace", _missing)
+        _render_validation_error("Step 3 — Consolidation", _missing)
         return
 
     group_overrides: dict = st.session_state.get(_SS_GROUP_OVERRIDES, {})
     effective_groups = _apply_group_overrides(intel.groups, group_overrides)
     file_names = [fp.file_name for fp in intel.file_profiles]
+    kpi_alignments = getattr(intel, "kpi_alignments", [])
+    kpi_redundancy = getattr(intel, "kpi_redundancy", [])
 
-    (tab_profiles, tab_kpi_disc, tab_groups, tab_pairwise,
-     tab_kpi_align, tab_overrides) = st.tabs([
-        "File Profiles",
-        "KPI Discovery",
-        "Consolidation Groups",
-        "5-Dimension Scores",
-        "KPI Alignment",
-        "Manual Overrides",
-    ])
+    # Accepted-state tracking (purely visual, no pipeline effect)
+    _ACCEPTED_KEY = "ar_consol_accepted"
+    accepted: set = st.session_state.setdefault(_ACCEPTED_KEY, set())
+    _OVERRIDE_OPEN_KEY = "ar_consol_override_open"
+    override_open: set = st.session_state.setdefault(_OVERRIDE_OPEN_KEY, set())
 
-    # ── Tab 1: File Profiles ──────────────────────────────────────────────────
-    with tab_profiles:
-        if intel.file_profiles:
-            # Build per-workbook KPI tab list from workbook_kpi_stats
-            kpi_tabs_by_file: dict[str, str] = {}
-            for wks in getattr(intel, "workbook_kpi_stats", []):
-                kpi_tabs_by_file[wks.workbook_name] = ", ".join(wks.kpi_tabs) if wks.kpi_tabs else "—"
+    consolidate_groups = [g for g in effective_groups if g.recommendation == "Consolidate" and len(g.file_names) > 1]
+    separate_groups    = [g for g in effective_groups if g.recommendation != "Consolidate" or len(g.file_names) == 1]
+    discard_files      = [r for r in kpi_redundancy if r.recommendation == "Discard"]
+    discard_names: set[str] = {r.file_name for r in discard_files}
 
-            rows = []
-            for fp in intel.file_profiles:
-                pk_str = ", ".join(fp.primary_key_candidates) if fp.primary_key_candidates else "—"
-                config_ss = st.session_state.get(_SS_CONFIG)
-                kpi_tabs_str = "—"
-                if config_ss:
-                    wb_cfg_fp = config_ss.config_for(fp.file_name)
-                    if wb_cfg_fp and hasattr(wb_cfg_fp, "kpi_tabs") and wb_cfg_fp.kpi_tabs:
-                        kpi_tabs_str = ", ".join(wb_cfg_fp.kpi_tabs)
-                rows.append({
-                    "File":              fp.file_name,
-                    "Source Tab":        fp.source_tab,
-                    "KPI Tabs":          kpi_tabs_by_file.get(fp.file_name, "—"),
-                    "Rows":              fp.row_count,
-                    "Total Columns":     fp.column_count,
-                    "Distinct Columns":  fp.distinct_columns,
-                    "KPI Columns":       fp.kpi_referenced_column_count,
-                    "Non-KPI Columns":   fp.non_kpi_column_count,
-                    "Inferred Grain":    fp.inferred_grain,
-                    "Grain Confidence":  f"{fp.grain_confidence:.0%}",
-                    "Primary Key(s)":    pk_str,
-                    "Time Dimension":    "Yes" if fp.has_time_dimension else "No",
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No file profiles available.")
+    # ── Summary bar ──────────────────────────────────────────────────────────
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Consolidate", len(consolidate_groups), help="Groups of files that can be merged")
+    s2.metric("Discard",     len(discard_files),      help="Files whose KPIs are fully covered by others")
+    s3.metric("Keep Separate", len(separate_groups),  help="Files with unique content that must remain independent")
 
-    # ── Tab 2: KPI Discovery ─────────────────────────────────────────────────
-    with tab_kpi_disc:
-        wb_kpi_stats = getattr(intel, "workbook_kpi_stats", [])
-        if not wb_kpi_stats:
-            st.info("KPI Discovery data not available — re-run from Step 2.")
-        else:
-            for wks in wb_kpi_stats:
-                conf_icon = _conf_color(wks.detection_confidence)
-                dt = getattr(wks, "detection_type", "Formula-Based")
-                dt_icon = {"Formula-Based": "🧮", "Pivot-Based": "🔄", "Mixed": "⚡"}.get(dt, "🧮")
-                with st.expander(
-                    f"{conf_icon} **{wks.workbook_name}** — "
-                    f"{wks.kpi_column_count} KPI column(s), "
-                    f"{wks.formula_count} formula(s)  {dt_icon} {dt}",
-                    expanded=True,
-                ):
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric("KPI Tabs Found", len(wks.kpi_tabs))
-                    c2.metric("KPI Formulas", wks.formula_count)
-                    c3.metric("KPI Columns", wks.kpi_column_count)
-                    c4.metric("Detection Confidence", f"{wks.detection_confidence:.0%}")
-                    c5.metric("Detection Type", dt)
-                    if wks.kpi_tabs:
-                        st.markdown(
-                            "**KPI Tabs Identified:** " +
-                            " · ".join(f"`{t}`" for t in wks.kpi_tabs)
-                        )
-                    if wks.reason_if_empty:
-                        st.warning(f"**Why no KPIs detected:** {wks.reason_if_empty}")
-                        st.markdown(
-                            "**Troubleshooting:**\n"
-                            "1. Verify the correct KPI tab is selected in Step 1.\n"
-                            "2. Check that KPI formulas reference source-data columns "
-                            "(e.g. `=SUMIFS(SQL_data!D:D, SQL_data!B:B, A1)`).\n"
-                            "3. Formulas that only reference other KPI-tab cells are "
-                            "classified as DERIVED and may not resolve to source columns."
-                        )
+    st.markdown("---")
 
-        # KPI Lineage
-        kpi_result_obj_ln = st.session_state.get(_SS_KPI)
-        kpi_analysis_ln = kpi_result_obj_ln.output if kpi_result_obj_ln else None
-        lineage = getattr(kpi_analysis_ln, "lineage", []) if kpi_analysis_ln else []
-        if lineage:
-            st.markdown("**KPI Lineage**")
-            lineage_by_wb: dict[str, list] = {}
-            for ln in lineage:
-                lineage_by_wb.setdefault(ln.workbook_name, []).append(ln)
-            for wb_name, wb_lineage in lineage_by_wb.items():
-                with st.expander(
-                    f"🔗 {wb_name} — {len(wb_lineage)} KPI lineage path(s)", expanded=False
-                ):
-                    unique_paths = list({ln.lineage_path for ln in wb_lineage})
-                    for path in sorted(unique_paths):
-                        st.code(path, language=None)
-                    type_counts: dict[str, int] = {}
-                    for ln in wb_lineage:
-                        type_counts[ln.kpi_type] = type_counts.get(ln.kpi_type, 0) + 1
-                    for ktype, cnt in type_counts.items():
-                        st.caption(f"{ktype}: {cnt}")
+    # ── CONSOLIDATE cards ────────────────────────────────────────────────────
+    if consolidate_groups:
+        st.markdown("### Consolidate")
+        for group in consolidate_groups:
+            card_key = f"group_{group.group_id}"
+            is_accepted = card_key in accepted
+            is_override = card_key in override_open
 
-    # ── Tab 3: Consolidation Groups ───────────────────────────────────────────
-    with tab_groups:
-        if not effective_groups:
-            st.info("No groups detected.")
-        else:
-            for group in effective_groups:
-                if group.recommendation == "Consolidate":
-                    icon, rec_tag = "🟢", "[Consolidate ✓]"
+            with st.container(border=True):
+                st.markdown(f"#### {'✅ ' if is_accepted else ''}Recommendation: CONSOLIDATE")
+                st.markdown("**Files:**")
+                for fname in group.file_names:
+                    st.markdown(f"- {fname}")
+
+                st.markdown(f"**Reason:** {group.reasoning}")
+
+                kpis = _kpis_for_group(group.file_names, kpi_alignments)
+                if kpis:
+                    st.markdown("**KPIs Covered:**")
+                    for kpi in kpis:
+                        st.markdown(f"- {kpi}")
+                    if len(kpis) == 8:
+                        st.caption("(showing first 8 — see View Analysis for full list)")
+
+                if not is_override:
+                    ba, bb = st.columns([1, 1])
+                    with ba:
+                        if st.button(
+                            "✅ Accept Recommendation" if not is_accepted else "✅ Accepted",
+                            key=f"accept_{card_key}",
+                            type="primary" if not is_accepted else "secondary",
+                        ):
+                            accepted.add(card_key)
+                            st.session_state[_ACCEPTED_KEY] = accepted
+                            st.rerun()
+                    with bb:
+                        if st.button("✏️ Override", key=f"override_open_{card_key}"):
+                            override_open.add(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
                 else:
-                    icon, rec_tag = "🟡", "[Keep Separate]"
+                    # ── Inline override form ──────────────────────────────────
+                    st.markdown("**Override — reassign files to groups:**")
+                    group_ids   = sorted({g.group_id for g in intel.groups})
+                    max_gid     = max(group_ids) if group_ids else 0
+                    for fname in file_names:
+                        current_gid = next((g.group_id for g in intel.groups if fname in g.file_names), 0)
+                        override_val = group_overrides.get(fname, current_gid)
+                        options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_gid + 1}", "Exclude"]
+                        options_ids    = group_ids + [max_gid + 1, None]
+                        safe_val = override_val if override_val in options_ids else current_gid
+                        current_idx = options_ids.index(safe_val) if safe_val in options_ids else 0
+                        fc1, fc2 = st.columns([3, 2])
+                        with fc1:
+                            st.markdown(f"`{fname}`")
+                        with fc2:
+                            chosen_label = st.selectbox(
+                                "Group",
+                                options_labels,
+                                index=current_idx,
+                                key=f"grp_ov_{card_key}_{fname}",
+                                label_visibility="collapsed",
+                            )
+                            new_gid = options_ids[options_labels.index(chosen_label)]
+                            group_overrides[fname] = new_gid
+
+                    oa, ob = st.columns([1, 1])
+                    with oa:
+                        if st.button("Apply", key=f"override_apply_{card_key}", type="primary"):
+                            st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
+                            override_open.discard(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+                    with ob:
+                        if st.button("Cancel", key=f"override_cancel_{card_key}"):
+                            override_open.discard(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+
+        st.markdown("---")
+
+    # ── DISCARD cards ────────────────────────────────────────────────────────
+    if discard_files:
+        st.markdown("### Discard")
+        for r in discard_files:
+            card_key = f"discard_{r.file_name}"
+            is_accepted = card_key in accepted
+            is_override = card_key in override_open
+
+            with st.container(border=True):
+                st.markdown(f"#### {'✅ ' if is_accepted else ''}Recommendation: DISCARD")
+                st.markdown(f"**File:** {r.file_name}")
+                st.markdown(f"**Reason:** {r.reason}")
+
+                st.markdown("**Unique KPIs:** None")
+
+                if r.covered_by:
+                    st.markdown(
+                        "**Covered By:** " + ", ".join(f"`{f}`" for f in r.covered_by)
+                    )
+
+                if not is_override:
+                    ba, bb = st.columns([1, 1])
+                    with ba:
+                        if st.button(
+                            "✅ Accept Recommendation" if not is_accepted else "✅ Accepted",
+                            key=f"accept_{card_key}",
+                            type="primary" if not is_accepted else "secondary",
+                        ):
+                            accepted.add(card_key)
+                            st.session_state[_ACCEPTED_KEY] = accepted
+                            st.rerun()
+                    with bb:
+                        if st.button("✏️ Override — Keep This File", key=f"override_open_{card_key}"):
+                            override_open.add(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+                else:
+                    st.markdown("**Override — assign to a group instead of discarding:**")
+                    group_ids    = sorted({g.group_id for g in intel.groups})
+                    max_gid      = max(group_ids) if group_ids else 1
+                    options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_gid + 1}"]
+                    options_ids    = group_ids + [max_gid + 1]
+                    chosen_label = st.selectbox(
+                        "Assign to group:",
+                        options_labels,
+                        key=f"grp_ov_discard_{r.file_name}",
+                        label_visibility="collapsed",
+                    )
+                    new_gid = options_ids[options_labels.index(chosen_label)]
+                    oa, ob = st.columns([1, 1])
+                    with oa:
+                        if st.button("Apply", key=f"override_apply_{card_key}", type="primary"):
+                            group_overrides[r.file_name] = new_gid
+                            st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
+                            override_open.discard(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+                    with ob:
+                        if st.button("Cancel", key=f"override_cancel_{card_key}"):
+                            override_open.discard(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+
+        st.markdown("---")
+
+    # ── KEEP SEPARATE cards ──────────────────────────────────────────────────
+    keep_sep = [g for g in separate_groups if not all(fn in discard_names for fn in g.file_names)]
+    if keep_sep:
+        st.markdown("### Keep Separate")
+        for group in keep_sep:
+            # For single-file groups show the file name as the heading
+            card_key = f"group_{group.group_id}"
+            is_accepted = card_key in accepted
+            is_override = card_key in override_open
+
+            with st.container(border=True):
+                st.markdown(f"#### {'✅ ' if is_accepted else ''}Recommendation: KEEP SEPARATE")
+                if len(group.file_names) == 1:
+                    st.markdown(f"**File:** {group.file_names[0]}")
+                else:
+                    st.markdown("**Files:**")
+                    for fname in group.file_names:
+                        st.markdown(f"- {fname}")
+
+                st.markdown(f"**Reason:** {group.reasoning or 'Contains unique KPIs not found in any other file.'}")
+
+                # Unique KPIs — aggregate per file for the group
+                unique_kpis: list[str] = []
+                for fname in group.file_names:
+                    unique_kpis.extend(
+                        k for k in _unique_kpis_for_file(fname, file_names, kpi_alignments)
+                        if k not in unique_kpis
+                    )
+                unique_kpis = unique_kpis[:8]
+                if unique_kpis:
+                    st.markdown("**Unique KPIs:**")
+                    for kpi in unique_kpis:
+                        st.markdown(f"- {kpi}")
+                else:
+                    st.markdown("**Unique KPIs:** —")
+
+                if group.incompatibility_detail:
+                    st.caption(group.incompatibility_detail)
+
+                if not is_override:
+                    ba, bb = st.columns([1, 1])
+                    with ba:
+                        if st.button(
+                            "✅ Accept Recommendation" if not is_accepted else "✅ Accepted",
+                            key=f"accept_{card_key}",
+                            type="primary" if not is_accepted else "secondary",
+                        ):
+                            accepted.add(card_key)
+                            st.session_state[_ACCEPTED_KEY] = accepted
+                            st.rerun()
+                    with bb:
+                        if st.button("✏️ Override — Merge with Group", key=f"override_open_{card_key}"):
+                            override_open.add(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+                else:
+                    st.markdown("**Override — merge into a consolidation group:**")
+                    group_ids    = sorted({g.group_id for g in intel.groups if g.recommendation == "Consolidate"})
+                    if not group_ids:
+                        group_ids = sorted({g.group_id for g in intel.groups})
+                    max_gid      = max(group_ids) if group_ids else 1
+                    options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_gid + 1}"]
+                    options_ids    = group_ids + [max_gid + 1]
+                    # Per-file assignment for multi-file separate groups
+                    for fname in group.file_names:
+                        fc1, fc2 = st.columns([3, 2])
+                        with fc1:
+                            st.markdown(f"`{fname}`")
+                        with fc2:
+                            current_gid = group_overrides.get(fname, group.group_id)
+                            safe_idx = options_ids.index(current_gid) if current_gid in options_ids else 0
+                            chosen_label = st.selectbox(
+                                "Group",
+                                options_labels,
+                                index=safe_idx,
+                                key=f"grp_ov_sep_{card_key}_{fname}",
+                                label_visibility="collapsed",
+                            )
+                            group_overrides[fname] = options_ids[options_labels.index(chosen_label)]
+
+                    oa, ob = st.columns([1, 1])
+                    with oa:
+                        if st.button("Apply", key=f"override_apply_{card_key}", type="primary"):
+                            st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
+                            override_open.discard(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+                    with ob:
+                        if st.button("Cancel", key=f"override_cancel_{card_key}"):
+                            override_open.discard(card_key)
+                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
+                            st.rerun()
+
+    # ── View Analysis (hidden by default) ───────────────────────────────────
+    with st.expander("View Analysis", expanded=False):
+        from src.agentic_rationalization.agents.consolidation_agent import compute_file_group_compatibility
+
+        ana_tab_groups, ana_tab_pairwise, ana_tab_kpi = st.tabs([
+            "Consolidation Groups", "Pairwise Scores", "KPI Redundancy"
+        ])
+
+        with ana_tab_groups:
+            for group in effective_groups:
+                icon = "🟢" if group.recommendation == "Consolidate" else "🟡"
                 with st.expander(
-                    f"{icon} Group {group.group_id} — {group.group_label}  {rec_tag}",
-                    expanded=True,
+                    f"{icon} Group {group.group_id} — {group.group_label}  [{group.recommendation}]",
+                    expanded=False,
                 ):
                     st.caption(group.reasoning)
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Common Columns", group.common_column_count)
-                    c2.metric("Total Union Cols", group.unique_column_count)
-                    c3.metric("KPI Required", group.kpi_required_column_count)
-                    c4.metric("Discardable", group.discardable_column_count)
-
+                    c1.metric("Common Columns",  group.common_column_count)
+                    c2.metric("Union Cols",       group.unique_column_count)
+                    c3.metric("KPI Required",     group.kpi_required_column_count)
+                    c4.metric("Discardable",      group.discardable_column_count)
                     contributions = getattr(group, "file_contributions", [])
                     if contributions:
-                        st.markdown("**Per-File Contribution Breakdown**")
                         contrib_rows = []
                         for fc in contributions:
                             contrib_rows.append({
-                                "File":                   fc.file_name,
-                                "Total Cols":             fc.total_columns,
-                                "KPI Cols":               fc.kpi_columns,
-                                "Key/Grain Cols":         fc.key_columns,
-                                "Common Contributed":     fc.common_columns_contributed,
-                                "Unique Contributed":     fc.unique_columns_contributed,
-                                "Discardable":            fc.discardable_columns,
+                                "File":                fc.file_name,
+                                "Total Cols":          fc.total_columns,
+                                "KPI Cols":            fc.kpi_columns,
+                                "Common Contributed":  fc.common_columns_contributed,
+                                "Unique Contributed":  fc.unique_columns_contributed,
+                                "Discardable":         fc.discardable_columns,
                             })
-                        st.dataframe(
-                            pd.DataFrame(contrib_rows),
-                            use_container_width=True, hide_index=True,
-                        )
+                        st.dataframe(pd.DataFrame(contrib_rows), use_container_width=True, hide_index=True)
                     else:
-                        st.markdown("**Files in Group:**")
                         for fname in group.file_names:
                             st.markdown(f"- `{fname}`")
+                    if group.recommendation == "Keep Separate" and group.incompatibility_detail:
+                        st.info(group.incompatibility_detail)
 
-                    detail = getattr(group, "incompatibility_detail", "")
-                    if group.recommendation == "Keep Separate" and detail:
-                        with st.expander("Why can't this file be combined?", expanded=False):
-                            st.markdown(detail)
-
-        # ── KPI Redundancy Analysis ───────────────────────────────────────────
-        kpi_redundancy = getattr(intel, "kpi_redundancy", [])
-        if kpi_redundancy:
-            st.markdown("---")
-            st.markdown("### KPI Redundancy Analysis")
-            st.caption(
-                "Redundancy is determined **only by KPI coverage**. "
-                "A file is redundant when every KPI-referenced column it contains "
-                "is already present in at least one other file. "
-                "Non-KPI columns (dimensions, metadata, unused attributes) are ignored."
-            )
-
-            n_redundant = sum(1 for r in kpi_redundancy if r.redundant)
-            n_partial   = sum(1 for r in kpi_redundancy if r.recommendation.startswith("Partial"))
-            n_retain    = sum(1 for r in kpi_redundancy if r.recommendation == "Retain")
-
-            rc1, rc2, rc3 = st.columns(3)
-            rc1.metric("🗑 Redundant (safe to discard)", n_redundant)
-            rc2.metric("⚠️ Partial — review required",  n_partial)
-            rc3.metric("✅ Retain (unique KPI coverage)", n_retain)
-
-            for r in kpi_redundancy:
-                if r.redundant:
-                    icon, border_color = "🗑", "red"
-                elif r.recommendation.startswith("Partial"):
-                    icon, border_color = "⚠️", "orange"
-                else:
-                    icon, border_color = "✅", "green"
-
-                with st.expander(
-                    f"{icon} **{r.file_name}** — {r.recommendation}  "
-                    f"({r.total_kpi_columns} KPI cols, {r.unique_kpi_columns} unique)",
-                    expanded=r.redundant,
-                ):
-                    col_a, col_b, col_c = st.columns(3)
-                    col_a.metric("Total KPI Columns", r.total_kpi_columns)
-                    col_b.metric("Unique KPI Columns", r.unique_kpi_columns,
-                                 delta=None,
-                                 help="KPI columns not present in any other file")
-                    col_c.metric("Covered By", len(r.covered_by))
-
-                    if r.recommendation == "Discard":
-                        st.error(f"**Recommendation: Discard**")
-                    elif r.recommendation.startswith("Partial"):
-                        st.warning(f"**Recommendation: {r.recommendation}**")
-                    else:
-                        st.success(f"**Recommendation: Retain**")
-
-                    st.markdown(r.reason)
-
-                    if r.covered_by:
-                        st.markdown(
-                            "**Covered by:** " + ", ".join(f"`{f}`" for f in r.covered_by)
-                        )
-
-        fr = intel.final_recommendation
-        if fr.consolidate_files:
-            st.success(f"**{fr.summary}**  {fr.business_reasoning}")
-        else:
-            st.info(f"**{fr.summary}**  {fr.business_reasoning}")
-
-        st.markdown("---")
-        st.markdown("**Download Analysis**")
-        dl1, dl2, dl3, dl4, dl5 = st.columns(5)
-        with dl1:
-            try:
-                st.download_button(
-                    "Column Mapping.xlsx", data=_build_column_mapping_xlsx(intel),
-                    file_name="Column_Mapping.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_col_map",
-                )
-            except Exception as e:
-                st.caption(f"Unavailable: {e}")
-        with dl2:
-            try:
-                st.download_button(
-                    "KPI Mapping.xlsx", data=_build_kpi_mapping_xlsx(intel),
-                    file_name="KPI_Mapping.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_kpi_map",
-                )
-            except Exception as e:
-                st.caption(f"Unavailable: {e}")
-        with dl3:
-            try:
-                st.download_button(
-                    "Consolidation Assessment.xlsx",
-                    data=_build_consolidation_assessment_xlsx(intel),
-                    file_name="Consolidation_Assessment.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_consol_assess",
-                )
-            except Exception as e:
-                st.caption(f"Unavailable: {e}")
-        with dl4:
-            try:
-                st.download_button(
-                    "Group Analysis.xlsx", data=_build_group_analysis_xlsx(intel),
-                    file_name="Group_Analysis.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_group_analysis",
-                )
-            except Exception as e:
-                st.caption(f"Unavailable: {e}")
-        with dl5:
-            try:
-                st.download_button(
-                    "Compatibility Matrix.xlsx",
-                    data=_build_compatibility_matrix_xlsx(intel),
-                    file_name="Compatibility_Matrix.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_compat_matrix",
-                )
-            except Exception as e:
-                st.caption(f"Unavailable: {e}")
-
-    # ── Tab 4: 5-Dimension Scores ─────────────────────────────────────────────
-    with tab_pairwise:
-        if not intel.pairwise_scores:
-            st.info("No pairwise scores (single file or no comparison possible).")
-        else:
-            for sc in intel.pairwise_scores:
-                with st.expander(
-                    f"`{sc.file_a}` vs `{sc.file_b}` — {sc.recommendation}",
-                    expanded=False,
-                ):
-                    g1, g2, g3, g4, g5, g6 = st.columns(6)
-                    g1.metric("Grain Compatibility", "✓" if sc.grain_compatible else "✗ Mismatch")
-                    g2.metric("Schema Similarity", f"{sc.schema_overlap_pct:.0%}")
-                    g3.metric("KPI Similarity", f"{sc.kpi_overlap_pct:.0%}")
-                    g4.metric("Key Compatible", "Yes" if sc.key_compatible else "No")
-                    g5.metric("Time Dimension", "Match" if sc.time_dimension_compatible else "Mismatch")
-                    g6.metric("Overall Score", f"{sc.overall_score:.0%}")
-
-                    rec_color = (
-                        "green" if sc.recommendation == "Consolidate"
-                        else ("orange" if sc.recommendation == "Conditionally Consolidate" else "red")
-                    )
-                    st.markdown(
-                        f"**Recommendation:** :{rec_color}[{sc.recommendation}]  "
-                        f"(confidence: {sc.recommendation_confidence:.0%})"
-                    )
-                    st.caption(sc.reasoning)
-
-                    if not sc.grain_compatible:
-                        st.markdown(
-                            f"> **Grain mismatch**: `{sc.file_a}` is *{sc.grain_a}*-level while "
-                            f"`{sc.file_b}` is *{sc.grain_b}*-level. "
-                            f"{sc.grain_a.title()}-level records cannot be directly merged with "
-                            f"{sc.grain_b.title()}-level records without aggregation — doing so "
-                            f"would produce incorrect totals."
-                        )
-                    elif sc.overall_score < 0.50:
-                        st.markdown(
-                            f"> **Low compatibility** (score {sc.overall_score:.0%}): Files are "
-                            f"grain-compatible but have insufficient KPI/schema overlap to justify "
-                            f"consolidation. They likely support different reporting objectives."
-                        )
-
-    # ── Tab 5: KPI Alignment ─────────────────────────────────────────────────
-    with tab_kpi_align:
-        kpi_alignments = getattr(intel, "kpi_alignments", [])
-        kpi_decisions: dict = st.session_state.get(_SS_KPI_ALIGN_DECISIONS, {})
-
-        if not kpi_alignments:
-            st.warning(
-                "No KPI columns identified. This usually means KPI analysis was not run before "
-                "consolidation, or no KPI formulas reference source-data columns."
-            )
-            st.markdown(
-                "**Troubleshooting:**\n"
-                "1. Return to Step 1 and verify KPI tabs are correctly identified.\n"
-                "2. Check the **KPI Discovery** tab for per-workbook detection details.\n"
-                "3. Ensure KPI formulas reference the source tab "
-                "(e.g. `=SUMIFS(SQL_data!D:D,SQL_data!B:B,A1)`)."
-            )
-        else:
-            partial = [a for a in kpi_alignments if a.status == "partial"]
-            aligned = [a for a in kpi_alignments if a.status == "aligned"]
-            missing = [a for a in kpi_alignments if a.status == "missing"]
-            all_canonicals = [a.canonical_kpi for a in kpi_alignments]
-
-            # ── Summary counts ────────────────────────────────────────────────
-            n_accepted = sum(1 for c in all_canonicals if kpi_decisions.get(c, "pending") == "accepted")
-            n_rejected = sum(1 for c in all_canonicals if kpi_decisions.get(c, "pending") == "rejected")
-            n_pending  = sum(1 for c in all_canonicals if kpi_decisions.get(c, "pending") not in ("accepted", "rejected"))
-
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            m1.metric("Fully Aligned",      len(aligned), help="KPI column present in all files")
-            m2.metric("Partially Aligned",  len(partial), help="KPI column present in some files only")
-            m3.metric("Missing",            len(missing), help="KPI column not found in any file")
-            m4.metric("✅ Accepted",         n_accepted)
-            m5.metric("❌ Rejected",         n_rejected)
-            m6.metric("❓ Pending Review",   n_pending)
-
-            # ── Global bulk actions ───────────────────────────────────────────
-            st.markdown("---")
-            st.markdown("**Bulk Actions**")
-            gc1, gc2, gc3 = st.columns(3)
-            with gc1:
-                if st.button("✅ Accept All Mappings", key="kpi_bulk_accept_all"):
-                    new = dict(kpi_decisions)
-                    for c in all_canonicals:
-                        new[c] = "accepted"
-                    st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                    st.rerun()
-            with gc2:
-                if st.button("❌ Reject All Mappings", key="kpi_bulk_reject_all"):
-                    new = dict(kpi_decisions)
-                    for c in all_canonicals:
-                        new[c] = "rejected"
-                    st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                    st.rerun()
-            with gc3:
-                if st.button("🔄 Reset All Decisions", key="kpi_bulk_reset_all"):
-                    new = {k: v for k, v in kpi_decisions.items() if k not in all_canonicals}
-                    st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                    st.rerun()
-
-            st.markdown("---")
-
-            if partial:
-                partial_canonicals = [a.canonical_kpi for a in partial]
-                pc1, pc2, pc3, _ = st.columns([1, 1, 1, 3])
-                with pc1:
-                    if st.button("✅ Accept Section", key="kpi_sec_accept_partial"):
-                        new = dict(kpi_decisions)
-                        for c in partial_canonicals:
-                            new[c] = "accepted"
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with pc2:
-                    if st.button("❌ Reject Section", key="kpi_sec_reject_partial"):
-                        new = dict(kpi_decisions)
-                        for c in partial_canonicals:
-                            new[c] = "rejected"
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with pc3:
-                    if st.button("🔄 Reset Section", key="kpi_sec_reset_partial"):
-                        new = {k: v for k, v in kpi_decisions.items() if k not in partial_canonicals}
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                st.markdown("**Partially Aligned KPIs — Review suggested matches**")
-                for aln in partial:
-                    dec = kpi_decisions.get(aln.canonical_kpi, "pending")
-                    status_icon = {"accepted": "✅", "rejected": "❌", "pending": "❓"}.get(dec, "❓")
+            # KPI redundancy table
+            if kpi_redundancy:
+                st.markdown("---")
+                st.markdown("**KPI Redundancy**")
+                for r in kpi_redundancy:
+                    icon = "🗑" if r.redundant else ("⚠️" if r.recommendation.startswith("Partial") else "✅")
                     with st.expander(
-                        f"{status_icon} `{aln.canonical_kpi}` — {aln.suggestion}",
-                        expanded=(dec == "pending"),
+                        f"{icon} {r.file_name} — {r.recommendation} "
+                        f"({r.total_kpi_columns} KPI cols, {r.unique_kpi_columns} unique)",
+                        expanded=False,
                     ):
-                        if aln.kpi_labels:
-                            st.caption(f"KPI formula label(s): {', '.join(aln.kpi_labels)}")
+                        st.markdown(r.reason)
+                        if r.covered_by:
+                            st.caption("Covered by: " + ", ".join(r.covered_by))
 
-                        match_rows = []
-                        for fn in file_names:
-                            raw = aln.per_file_match.get(fn, "")
-                            conf = aln.per_file_confidence.get(fn, 0.0)
-                            if conf == 1.0:
-                                match_type = "Exact"
-                            elif conf >= 0.90:
-                                match_type = "Column match"
-                            elif raw:
-                                match_type = f"Fuzzy ({conf:.0%})"
-                            else:
-                                match_type = "—"
-                            rec = "Match" if conf >= 0.90 else ("Possible Match" if conf >= 0.70 else "Review")
-                            match_rows.append({
-                                "Source Workbook":  fn,
-                                "Canonical KPI":    aln.canonical_kpi,
-                                "Source KPI Name":  ", ".join(aln.kpi_labels) if aln.kpi_labels else aln.canonical_kpi,
-                                "Mapped Column":    raw if raw else "(not found)",
-                                "Confidence":       f"{conf:.0%}" if raw else "—",
-                                "Match Type":       match_type,
-                                "Recommendation":   rec if raw else "No match",
-                            })
-                        st.dataframe(pd.DataFrame(match_rows), use_container_width=True, hide_index=True)
-
-                        ba, br, bm_col = st.columns([1, 1, 2])
-                        with ba:
-                            if st.button("✅ Accept Mapping", key=f"kpi_accept_{aln.canonical_kpi}"):
-                                kpi_decisions[aln.canonical_kpi] = "accepted"
-                                st.session_state[_SS_KPI_ALIGN_DECISIONS] = kpi_decisions
-                                st.rerun()
-                        with br:
-                            if st.button("❌ Reject Mapping", key=f"kpi_reject_{aln.canonical_kpi}"):
-                                kpi_decisions[aln.canonical_kpi] = "rejected"
-                                st.session_state[_SS_KPI_ALIGN_DECISIONS] = kpi_decisions
-                                st.rerun()
-                        with bm_col:
-                            manual_val = st.text_input(
-                                "Manual map to canonical:",
-                                key=f"kpi_manual_{aln.canonical_kpi}",
-                                placeholder="e.g. gross_reserve",
-                                label_visibility="collapsed",
-                            )
-                            if manual_val and st.button("Apply Manual", key=f"kpi_mapply_{aln.canonical_kpi}"):
-                                kpi_decisions[aln.canonical_kpi] = f"manual:{manual_val}"
-                                st.session_state[_SS_KPI_ALIGN_DECISIONS] = kpi_decisions
-                                st.rerun()
-
-            if aligned:
-                aligned_canonicals = [a.canonical_kpi for a in aligned]
-                ac1, ac2, ac3, _ = st.columns([1, 1, 1, 3])
-                with ac1:
-                    if st.button("✅ Accept Section", key="kpi_sec_accept_aligned"):
-                        new = dict(kpi_decisions)
-                        for c in aligned_canonicals:
-                            new[c] = "accepted"
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with ac2:
-                    if st.button("❌ Reject Section", key="kpi_sec_reject_aligned"):
-                        new = dict(kpi_decisions)
-                        for c in aligned_canonicals:
-                            new[c] = "rejected"
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with ac3:
-                    if st.button("🔄 Reset Section", key="kpi_sec_reset_aligned"):
-                        new = {k: v for k, v in kpi_decisions.items() if k not in aligned_canonicals}
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with st.expander(f"✅ Fully Aligned KPI Columns ({len(aligned)})", expanded=False):
-                    aligned_rows = []
-                    for a in aligned:
-                        dec = kpi_decisions.get(a.canonical_kpi, "pending")
-                        status_icon = {"accepted": "✅", "rejected": "❌", "pending": "❓"}.get(dec, "❓")
-                        row = {
-                            "": status_icon,
-                            "Canonical KPI": a.canonical_kpi,
-                            "KPI Label(s)":  ", ".join(a.kpi_labels),
-                            "Decision":      dec,
-                        }
-                        for fn in file_names:
-                            row[fn] = a.per_file_match.get(fn, "")
-                        aligned_rows.append(row)
-                    st.dataframe(pd.DataFrame(aligned_rows), use_container_width=True, hide_index=True)
-
-            if missing:
-                missing_canonicals = [a.canonical_kpi for a in missing]
-                mc1, mc2, mc3, _ = st.columns([1, 1, 1, 3])
-                with mc1:
-                    if st.button("✅ Accept Section", key="kpi_sec_accept_missing"):
-                        new = dict(kpi_decisions)
-                        for c in missing_canonicals:
-                            new[c] = "accepted"
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with mc2:
-                    if st.button("❌ Reject Section", key="kpi_sec_reject_missing"):
-                        new = dict(kpi_decisions)
-                        for c in missing_canonicals:
-                            new[c] = "rejected"
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with mc3:
-                    if st.button("🔄 Reset Section", key="kpi_sec_reset_missing"):
-                        new = {k: v for k, v in kpi_decisions.items() if k not in missing_canonicals}
-                        st.session_state[_SS_KPI_ALIGN_DECISIONS] = new
-                        st.rerun()
-                with st.expander(f"⚠️ Missing KPI Columns ({len(missing)})", expanded=False):
-                    st.caption("Not found in any source file.")
-                    st.dataframe(
-                        pd.DataFrame([{"Canonical": a.canonical_kpi, "KPI Label(s)": ", ".join(a.kpi_labels)} for a in missing]),
-                        use_container_width=True, hide_index=True,
+            # Downloads
+            st.markdown("---")
+            st.markdown("**Download Analysis**")
+            dl1, dl2, dl3, dl4, dl5 = st.columns(5)
+            with dl1:
+                try:
+                    st.download_button(
+                        "Column Mapping.xlsx", data=_build_column_mapping_xlsx(intel),
+                        file_name="Column_Mapping.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_col_map",
                     )
+                except Exception as e:
+                    st.caption(f"Unavailable: {e}")
+            with dl2:
+                try:
+                    st.download_button(
+                        "KPI Mapping.xlsx", data=_build_kpi_mapping_xlsx(intel),
+                        file_name="KPI_Mapping.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_kpi_map",
+                    )
+                except Exception as e:
+                    st.caption(f"Unavailable: {e}")
+            with dl3:
+                try:
+                    st.download_button(
+                        "Consolidation Assessment.xlsx",
+                        data=_build_consolidation_assessment_xlsx(intel),
+                        file_name="Consolidation_Assessment.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_consol_assess",
+                    )
+                except Exception as e:
+                    st.caption(f"Unavailable: {e}")
+            with dl4:
+                try:
+                    st.download_button(
+                        "Group Analysis.xlsx", data=_build_group_analysis_xlsx(intel),
+                        file_name="Group_Analysis.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_group_analysis",
+                    )
+                except Exception as e:
+                    st.caption(f"Unavailable: {e}")
+            with dl5:
+                try:
+                    st.download_button(
+                        "Compatibility Matrix.xlsx",
+                        data=_build_compatibility_matrix_xlsx(intel),
+                        file_name="Compatibility_Matrix.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_compat_matrix",
+                    )
+                except Exception as e:
+                    st.caption(f"Unavailable: {e}")
 
-    # ── Tab 6: Manual Group Overrides ────────────────────────────────────────
-    with tab_overrides:
-        st.markdown("**File-to-Group Compatibility Matrix**")
-        st.caption("Shows how compatible each file would be if moved to each group.")
+        with ana_tab_pairwise:
+            if not intel.pairwise_scores:
+                st.info("No pairwise scores (single file or no comparison possible).")
+            else:
+                for sc in intel.pairwise_scores:
+                    with st.expander(
+                        f"`{sc.file_a}` vs `{sc.file_b}` — {sc.recommendation}",
+                        expanded=False,
+                    ):
+                        g1, g2, g3, g4, g5, g6 = st.columns(6)
+                        g1.metric("Grain Compatible", "✓" if sc.grain_compatible else "✗")
+                        g2.metric("Schema Similarity", f"{sc.schema_overlap_pct:.0%}")
+                        g3.metric("KPI Similarity",    f"{sc.kpi_overlap_pct:.0%}")
+                        g4.metric("Key Compatible",    "Yes" if sc.key_compatible else "No")
+                        g5.metric("Time Dimension",    "Match" if sc.time_dimension_compatible else "Mismatch")
+                        g6.metric("Overall Score",     f"{sc.overall_score:.0%}")
+                        st.caption(sc.reasoning)
+                        if not sc.grain_compatible:
+                            st.info(
+                                f"Grain mismatch: `{sc.file_a}` is {sc.grain_a}-level, "
+                                f"`{sc.file_b}` is {sc.grain_b}-level."
+                            )
 
-        matrix_rows = []
-        for fp in intel.file_profiles:
-            compat = compute_file_group_compatibility(
-                fp.file_name, intel.groups, intel.pairwise_scores
-            )
-            current_gid = next(
-                (g.group_id for g in intel.groups if fp.file_name in g.file_names), None
-            )
-            best_gid, best_score = None, -1.0
-            row: dict = {"File": fp.file_name, "Current Group": f"Group {current_gid}" if current_gid else "—"}
-            for gid, scores in sorted(compat.items()):
-                row[f"Grp {gid} Score"] = f"{scores['overall_score']:.0%}"
-                if scores["overall_score"] > best_score:
-                    best_score, best_gid = scores["overall_score"], gid
-            row["Recommended"] = f"Group {best_gid}" if best_gid else "—"
-            matrix_rows.append(row)
-        if matrix_rows:
-            st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
+        with ana_tab_kpi:
+            kpi_alignments_full = getattr(intel, "kpi_alignments", [])
+            if not kpi_alignments_full:
+                st.info("No KPI alignment data available.")
+            else:
+                aligned = [a for a in kpi_alignments_full if a.status == "aligned"]
+                partial = [a for a in kpi_alignments_full if a.status == "partial"]
+                missing = [a for a in kpi_alignments_full if a.status == "missing"]
+                st.metric("Fully Aligned", len(aligned))
+                if aligned:
+                    with st.expander(f"Fully Aligned ({len(aligned)})", expanded=False):
+                        rows = []
+                        for a in aligned:
+                            row = {"Canonical KPI": a.canonical_kpi, "KPI Label(s)": ", ".join(a.kpi_labels)}
+                            for fn in file_names:
+                                row[fn] = a.per_file_match.get(fn, "")
+                            rows.append(row)
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                if partial:
+                    with st.expander(f"Partially Aligned ({len(partial)})", expanded=False):
+                        rows = []
+                        for a in partial:
+                            row = {"Canonical KPI": a.canonical_kpi, "Status": a.suggestion}
+                            for fn in file_names:
+                                conf = a.per_file_confidence.get(fn, 0.0)
+                                raw  = a.per_file_match.get(fn, "")
+                                row[fn] = f"{raw} ({conf:.0%})" if raw else "—"
+                            rows.append(row)
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                if missing:
+                    with st.expander(f"Missing ({len(missing)})", expanded=False):
+                        st.dataframe(
+                            pd.DataFrame([{"Canonical": a.canonical_kpi, "Labels": ", ".join(a.kpi_labels)} for a in missing]),
+                            use_container_width=True, hide_index=True,
+                        )
 
-        st.markdown("---")
-        st.markdown("**Per-File Decision Support**")
-        for fp in intel.file_profiles:
-            compat = compute_file_group_compatibility(
-                fp.file_name, intel.groups, intel.pairwise_scores
-            )
-            with st.expander(f"📊 `{fp.file_name}`", expanded=False):
-                for gid, scores in sorted(compat.items()):
-                    st.markdown(f"**Group {gid}:** Overall {scores['overall_score']:.0%} → {scores['recommendation']}")
-                    dc1, dc2, dc3, dc4, dc5 = st.columns(5)
-                    dc1.metric("Grain", f"{scores['grain_score']:.0%}")
-                    dc2.metric("KPI Sim", f"{scores['kpi_score']:.0%}")
-                    dc3.metric("Schema", f"{scores['schema_score']:.0%}")
-                    dc4.metric("Key", f"{scores['key_score']:.0%}")
-                    dc5.metric("Time", f"{scores['time_score']:.0%}")
-
-        st.markdown("---")
-        st.markdown(
-            "**Move files between groups, exclude files, or create new groups.**  "
-            "Click **Apply Overrides** when done."
-        )
-
-        group_overrides = st.session_state.get(_SS_GROUP_OVERRIDES, {})
-        group_ids   = sorted({g.group_id for g in intel.groups})
-        max_group_id = max(group_ids) if group_ids else 0
-
-        for fname in file_names:
-            current_group = next(
-                (g.group_id for g in intel.groups if fname in g.file_names), 0
-            )
-            override_val = group_overrides.get(fname, current_group)
-            exclude_now  = override_val is None
-
-            fc1, fc2, fc3 = st.columns([3, 2, 1])
-            with fc1:
-                st.markdown(f"`{fname}`")
-            with fc2:
-                options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_group_id + 1}"]
-                options_ids    = group_ids + [max_group_id + 1]
-                safe_val = override_val if override_val in options_ids else current_group
-                current_idx = options_ids.index(safe_val) if safe_val in options_ids else 0
-                chosen_label = st.selectbox(
-                    "Move to group:",
-                    options_labels,
-                    index=current_idx,
-                    key=f"grp_override_{fname}",
-                    label_visibility="collapsed",
-                )
-                new_gid = options_ids[options_labels.index(chosen_label)]
-                group_overrides[fname] = new_gid
-            with fc3:
-                if st.checkbox("Exclude", value=exclude_now, key=f"grp_exclude_{fname}"):
-                    group_overrides[fname] = None
-
-        col_apply, col_reset = st.columns(2)
-        with col_apply:
-            if st.button("Apply Overrides", key="ar_btn_apply_overrides"):
-                st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
-                st.rerun()
-        with col_reset:
-            if st.button("Reset to Agent Defaults", key="ar_btn_reset_overrides"):
-                st.session_state.pop(_SS_GROUP_OVERRIDES, None)
-                st.rerun()
-
-    # ── Agent details + continue ──────────────────────────────────────────────
-    with st.expander("Agent Details", expanded=False):
-        _render_agent_card(consol_result)
-
+    # ── Continue ─────────────────────────────────────────────────────────────
+    st.markdown("---")
     if step == 3:
         if st.button("✅ Confirm Groups & Continue", type="primary", key="ar_btn_confirm_consol"):
             if group_overrides:
                 st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
             _set_step(4)
             st.rerun()
+
+
 
 
 def _render_step_4() -> None:
