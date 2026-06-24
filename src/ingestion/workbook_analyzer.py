@@ -439,9 +439,15 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
                     if name:
                         pv_value_fields.append(name)
 
-            # Fallback: use business-measure heuristic on all cache fields
+            # Fallback: use business-measure heuristic on all cache fields ONLY for
+            # fields not already classified as dimensions (row/col/filter).
+            # Collect all current dimension names to exclude them from heuristic.
             if not pv_value_fields:
-                pv_value_fields = [f for f in cache_fields if _looks_like_measure(f)]
+                current_dim_names: set[str] = set(row_fields_raw) | set(col_fields_raw) | set(filter_fields_raw)
+                pv_value_fields = [
+                    f for f in cache_fields
+                    if _looks_like_measure(f) and f not in current_dim_names
+                ]
 
             for f in pv_value_fields:
                 if f not in value_fields:
@@ -494,16 +500,62 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
                     sheet_name,
                 )
 
+        # A field must belong to exactly one role: if a name appears in both
+        # dimension lists and value_fields, the explicit dataField wins
+        # (measure role takes precedence over heuristic dimension placement).
+        value_set: set[str] = set(value_fields)
         infos.append(_PivotInfo(
             sheet_name=sheet_name,
             source_sheets=source_sheets,
             value_fields=value_fields,
-            row_fields=row_fields_raw,
-            col_fields=col_fields_raw,
-            filter_fields=filter_fields_raw,
+            row_fields=[f for f in row_fields_raw    if f not in value_set],
+            col_fields=[f for f in col_fields_raw    if f not in value_set],
+            filter_fields=[f for f in filter_fields_raw if f not in value_set],
         ))
 
     return infos
+
+
+def build_kpi_blocks_from_pivot(raw_wb: Any, sheet_name: str) -> "list[KpiBlock]":
+    """Build a :class:`KpiBlock` for a pivot sheet using only pivot table metadata.
+
+    Classification rules (Excel pivot table structure):
+
+    * Report Filters (pageFields)  → Dimensions
+    * Row Fields   (rowFields)     → Dimensions
+    * Column Fields (colFields)    → Dimensions
+    * Value Fields  (dataFields)   → KPI Measures (aggregation prefix stripped)
+
+    Returns a one-element list whose single :class:`KpiBlock` covers the whole
+    sheet, or an empty list if the sheet has no pivot tables.
+    """
+    pivot_infos = _scan_pivots(raw_wb)
+    pinfo = next((p for p in pivot_infos if p.sheet_name == sheet_name), None)
+    if pinfo is None:
+        return []
+
+    # Dimensions: filters first (page/report filters), then row, then column
+    seen: set[str] = set()
+    dims: list[str] = []
+    for fname in pinfo.filter_fields + pinfo.row_fields + pinfo.col_fields:
+        if fname not in seen:
+            seen.add(fname)
+            dims.append(fname)
+
+    # Measures: strip aggregation prefixes ("Sum of", "Average of", etc.)
+    measures: list[KpiMeasure] = [strip_aggregate_prefix(f) for f in pinfo.value_fields]
+
+    if not dims and not measures:
+        return []
+
+    return [KpiBlock(
+        block_name=sheet_name,
+        dimensions=dims,
+        kpi_measures=measures,
+        header_row=1,
+        data_start_row=2,
+        data_end_row=0,  # unknown without scanning rows; callers can override
+    )]
 
 
 # ---------------------------------------------------------------------------

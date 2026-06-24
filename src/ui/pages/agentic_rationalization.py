@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from src.ingestion.loader import load_workbook_from_bytes
-from src.ingestion.workbook_analyzer import scan_kpi_blocks, _get_raw_ws
+from src.ingestion.workbook_analyzer import scan_kpi_blocks, _get_raw_ws, build_kpi_blocks_from_pivot
 from src.agentic_rationalization.orchestrator import run_pipeline
 from src.agentic_rationalization.pipeline_phases import (
     run_discovery_phase,
@@ -572,52 +572,22 @@ def _render_step_2() -> None:
             st.markdown(f"**Selected Tab: `{explorer_sheet}`**")
             explorer_tag = current_tags.get(explorer_sheet, "Ignore")
 
-            # For KPI tabs, attempt block-level structure detection (result cached)
+            # For KPI tabs, attempt block-level structure detection (result cached).
+            # For pivot-based tabs: always use pivot metadata (report filters /
+            # row / column fields → dimensions; data fields → measures).
+            # For formula-based tabs: scan visible cells for multi-block structure.
             kpi_blocks = []
             if explorer_tag == "KPI":
                 blocks_cache: dict = st.session_state.setdefault(_SS_BLOCKS_CACHE, {})
                 cache_key = (selected_wb, explorer_sheet)
                 if cache_key not in blocks_cache:
-                    # Prefer pivot metadata when available — it gives authoritative
-                    # Row/Col/Filter = dimensions, Data = KPI measures classification.
-                    wb_analyses = st.session_state.get(_SS_WB_ANALYSES) or []
-                    tab_analysis = next(
-                        (
-                            t
-                            for a in wb_analyses
-                            if a.workbook_name == selected_wb
-                            for t in a.tab_analyses
-                            if t.tab_name == explorer_sheet
-                        ),
-                        None,
-                    )
-                    if tab_analysis is not None and tab_analysis.is_pivot_sheet and tab_analysis.pivot_value_fields:
-                        from src.ingestion.workbook_analyzer import KpiBlock, KpiMeasure  # noqa: F401
-                        all_dim_fields = (
-                            tab_analysis.pivot_filter_fields
-                            + tab_analysis.pivot_row_fields
-                            + tab_analysis.pivot_col_fields
-                        )
-                        # Deduplicate while preserving order
-                        seen: set[str] = set()
-                        dims: list[str] = []
-                        for f in all_dim_fields:
-                            if f not in seen:
-                                seen.add(f)
-                                dims.append(f)
-                        blocks_cache[cache_key] = [
-                            KpiBlock(
-                                block_name=explorer_sheet,
-                                dimensions=dims,
-                                kpi_measures=tab_analysis.pivot_value_fields,
-                                header_row=1,
-                                data_start_row=2,
-                                data_end_row=len(df_exp) + 1,
-                            )
-                        ]
+                    raw_wb = getattr(bundle, "_raw_wb", None)
+                    raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
+                    if raw_ws is not None and getattr(raw_ws, "_pivots", []):
+                        # Pivot sheet: use metadata exclusively
+                        blocks_cache[cache_key] = build_kpi_blocks_from_pivot(raw_wb, explorer_sheet)
                     else:
-                        raw_wb = getattr(bundle, "_raw_wb", None)
-                        raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
+                        # Formula-based sheet: scan visible cells
                         blocks_cache[cache_key] = scan_kpi_blocks(raw_ws) if raw_ws is not None else []
                 kpi_blocks = blocks_cache[cache_key]
 

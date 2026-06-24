@@ -43,7 +43,7 @@ from src.agentic_rationalization.models import AgentDecision, AgentResult
 from src.agentic_rationalization.grain_detector import detect_grain, GrainDetectionResult
 from src.agentic_rationalization.compatibility_scorer import score_compatibility, CompatibilityScore
 from src.schema_matching.normalizer import normalize_column_name
-from src.ingestion.workbook_analyzer import scan_kpi_blocks, _get_raw_ws
+from src.ingestion.workbook_analyzer import scan_kpi_blocks, _get_raw_ws, build_kpi_blocks_from_pivot
 
 logger = logging.getLogger(__name__)
 
@@ -932,6 +932,9 @@ def run(
     )
 
     # ── KPI block scan (for block-level redundancy and UI display) ────────────
+    # For pivot-based KPI tabs: use pivot metadata (report filters/rows/cols =
+    # dimensions, data fields = measures). Fall back to cell-scanning only for
+    # non-pivot formula-based tabs.
     kpi_blocks_by_file: dict[str, list] = {}
     for bundle in bundles:
         fname = getattr(bundle, "file_name", str(bundle))
@@ -942,9 +945,17 @@ def run(
         all_blocks: list = []
         for kpi_tab in (wb_cfg.kpi_tabs or []):
             raw_ws = _get_raw_ws(raw_wb, kpi_tab)
-            if raw_ws is not None:
-                tab_blocks = scan_kpi_blocks(raw_ws)
-                all_blocks.extend(tab_blocks)
+            if raw_ws is None:
+                continue
+            # Prefer pivot metadata when the tab contains pivot tables
+            if getattr(raw_ws, "_pivots", []):
+                pivot_blocks = build_kpi_blocks_from_pivot(raw_wb, kpi_tab)
+                if pivot_blocks:
+                    all_blocks.extend(pivot_blocks)
+                    continue
+            # Non-pivot: scan visible cells for multi-block KPI structure
+            tab_blocks = scan_kpi_blocks(raw_ws)
+            all_blocks.extend(tab_blocks)
         if all_blocks:
             kpi_blocks_by_file[fname] = all_blocks
 
