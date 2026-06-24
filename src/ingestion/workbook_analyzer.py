@@ -572,15 +572,10 @@ def analyze_workbook(
                     "Extracted %d KPI definition(s) from '%s/%s'",
                     len(kpis), wb_name, sheet_name,
                 )
-            # Detect multi-block structure for KPI/summary tabs
-            if tab.tab_type in (TabType.KPI_SUMMARY, TabType.DASHBOARD, TabType.OUTPUT):
-                tab.kpi_blocks = scan_kpi_blocks(raw_ws)
-                if tab.kpi_blocks:
-                    n_measures = sum(len(b.kpi_measures) for b in tab.kpi_blocks)
-                    logger.info(
-                        "KPI tab '%s/%s': %d block(s), %d measure(s) detected",
-                        wb_name, sheet_name, len(tab.kpi_blocks), n_measures,
-                    )
+            # KPI block detection is intentionally deferred — it is computed
+            # lazily (and cached) by the UI when a KPI tab is selected in the
+            # Column Explorer.  Running it here during analysis would scan up
+            # to 2 000 rows per KPI tab on every discovery run.
 
     analysis = WorkbookAnalysis(
         workbook_name=wb_name,

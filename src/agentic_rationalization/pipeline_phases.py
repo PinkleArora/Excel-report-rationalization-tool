@@ -29,6 +29,7 @@ def run_discovery_phase(
     bundles: list,
     config=None,  # config unused — discovery produces the config; kept for API symmetry
     overrides: dict | None = None,
+    analyses: list | None = None,
 ) -> AgentResult:
     """Phase 1: Workbook discovery — classify tabs and build RationalizationConfig.
 
@@ -37,11 +38,15 @@ def run_discovery_phase(
         config: Ignored (discovery produces the config). Kept for a consistent signature.
         overrides: Optional ``{workbook_name: {"source_tab": "...", "kpi_tabs": [...]}}``
             overrides for the discovery agent.
+        analyses: Pre-computed WorkbookAnalysis objects.  When provided the
+            expensive ``analyze_many`` scan is skipped entirely; the caller
+            caches these between override-only re-runs to eliminate redundant
+            workbook re-scanning.
 
     Returns:
         AgentResult whose ``output`` is a RationalizationConfig.
     """
-    return discovery_agent.run(bundles, overrides=overrides or {})
+    return discovery_agent.run(bundles, overrides=overrides or {}, analyses=analyses)
 
 
 def run_consolidation_phase(

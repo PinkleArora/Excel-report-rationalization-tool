@@ -44,6 +44,7 @@ _SS_STEP           = "ar_step"
 _SS_BUNDLES        = "ar_bundles"
 _SS_CONFIG         = "ar_config"
 _SS_DISCOVERY      = "ar_discovery"
+_SS_WB_ANALYSES    = "ar_wb_analyses"   # cached WorkbookAnalysis list — survives override changes
 _SS_CONSOLIDATION  = "ar_consolidation"
 _SS_SELECTED_GROUP = "ar_selected_group"
 _SS_SCHEMA         = "ar_schema"
@@ -53,6 +54,10 @@ _SS_GENERATION     = "ar_generation"
 _SS_SOURCE_TAB_OVERRIDES  = "ar_src_overrides"
 _SS_GROUP_OVERRIDES       = "ar_group_overrides"   # dict[str, int|None] file→group_id (None=excluded)
 _SS_KPI_ALIGN_DECISIONS   = "ar_kpi_align"         # dict[canonical, "accepted"|"rejected"|pending]
+
+# UI render caches — survive re-renders, cleared on new upload
+_SS_STRUCT_CACHE  = "ar_struct_cache"   # (wb_name, sheet) → structure label string
+_SS_BLOCKS_CACHE  = "ar_blocks_cache"   # (wb_name, sheet) → list[KpiBlock]
 
 # Legacy keys kept for the override review panel
 _OVERRIDES_KEY = "agentic_decision_overrides"
@@ -71,9 +76,11 @@ def _set_step(n: int) -> None:
 
 def _reset_state() -> None:
     for key in [
-        _SS_STEP, _SS_BUNDLES, _SS_CONFIG, _SS_DISCOVERY, _SS_CONSOLIDATION,
-        _SS_SELECTED_GROUP, _SS_SCHEMA, _SS_KPI, _SS_VALIDATION, _SS_GENERATION,
+        _SS_STEP, _SS_BUNDLES, _SS_CONFIG, _SS_DISCOVERY, _SS_WB_ANALYSES,
+        _SS_CONSOLIDATION, _SS_SELECTED_GROUP, _SS_SCHEMA, _SS_KPI,
+        _SS_VALIDATION, _SS_GENERATION,
         _SS_SOURCE_TAB_OVERRIDES, _SS_GROUP_OVERRIDES, _SS_KPI_ALIGN_DECISIONS,
+        _SS_STRUCT_CACHE, _SS_BLOCKS_CACHE,
         _OVERRIDES_KEY, _ACTION_KEY, "ar_kpi_tab_overrides", "ar_detection_type_overrides",
     ]:
         st.session_state.pop(key, None)
@@ -375,7 +382,18 @@ def _render_step_1() -> None:
 
 
 def _tab_structure_label(bundle, sheet_name: str, discovery_result: "AgentResult | None") -> str:
-    """Return 'Raw Data', 'Pivot Table', or 'Formula Based' for a tab."""
+    """Return 'Raw Data', 'Pivot Table', or 'Formula Based' for a tab (result cached)."""
+    cache_key = (getattr(bundle, "file_name", ""), sheet_name)
+    struct_cache: dict = st.session_state.setdefault(_SS_STRUCT_CACHE, {})
+    if cache_key in struct_cache:
+        return struct_cache[cache_key]
+    label = _tab_structure_label_compute(bundle, sheet_name, discovery_result)
+    struct_cache[cache_key] = label
+    return label
+
+
+def _tab_structure_label_compute(bundle, sheet_name: str, discovery_result: "AgentResult | None") -> str:
+    """Internal: compute structure label without caching."""
     # Check pivot signal from discovery decisions
     if discovery_result:
         for d in discovery_result.decisions:
@@ -421,7 +439,20 @@ def _render_step_2() -> None:
         st.warning("No bundles loaded. Return to Step 1.")
         return
 
-    # ── Run discovery if not already done ────────────────────────────────────
+    # ── Phase 1: workbook structural analysis (cached — only runs once per upload) ──
+    from src.ingestion.workbook_analyzer import analyze_many
+    wb_analyses = st.session_state.get(_SS_WB_ANALYSES)
+    if wb_analyses is None:
+        with st.spinner("Analysing workbooks…"):
+            try:
+                wb_analyses = analyze_many(bundles)
+            except Exception as exc:
+                st.error(f"Workbook analysis failed: `{type(exc).__name__}: {exc}`")
+                st.code(traceback.format_exc(), language="python")
+                return
+        st.session_state[_SS_WB_ANALYSES] = wb_analyses
+
+    # ── Phase 2: build RationalizationConfig from cached analyses (fast) ─────
     discovery_result: AgentResult | None = st.session_state.get(_SS_DISCOVERY)
     if discovery_result is None:
         src_overrides = st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {})
@@ -433,13 +464,16 @@ def _render_step_2() -> None:
             if fname not in discovery_overrides:
                 discovery_overrides[fname] = {}
             discovery_overrides[fname]["kpi_tabs"] = kpi_tabs_list
-        with st.spinner("Running Discovery…"):
-            try:
-                discovery_result = run_discovery_phase(bundles, overrides=discovery_overrides)
-            except Exception as exc:
-                st.error(f"Discovery failed: `{type(exc).__name__}: {exc}`")
-                st.code(traceback.format_exc(), language="python")
-                return
+        try:
+            discovery_result = run_discovery_phase(
+                bundles,
+                overrides=discovery_overrides,
+                analyses=wb_analyses,
+            )
+        except Exception as exc:
+            st.error(f"Discovery failed: `{type(exc).__name__}: {exc}`")
+            st.code(traceback.format_exc(), language="python")
+            return
         st.session_state[_SS_DISCOVERY] = discovery_result
         st.session_state[_SS_CONFIG] = discovery_result.output
 
@@ -538,12 +572,16 @@ def _render_step_2() -> None:
             st.markdown(f"**Selected Tab: `{explorer_sheet}`**")
             explorer_tag = current_tags.get(explorer_sheet, "Ignore")
 
-            # For KPI tabs, attempt block-level structure detection
+            # For KPI tabs, attempt block-level structure detection (result cached)
             kpi_blocks = []
             if explorer_tag == "KPI":
-                raw_wb = getattr(bundle, "_raw_wb", None)
-                raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
-                kpi_blocks = scan_kpi_blocks(raw_ws) if raw_ws is not None else []
+                blocks_cache: dict = st.session_state.setdefault(_SS_BLOCKS_CACHE, {})
+                cache_key = (selected_wb, explorer_sheet)
+                if cache_key not in blocks_cache:
+                    raw_wb = getattr(bundle, "_raw_wb", None)
+                    raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
+                    blocks_cache[cache_key] = scan_kpi_blocks(raw_ws) if raw_ws is not None else []
+                kpi_blocks = blocks_cache[cache_key]
 
             struct_label = _tab_structure_label(bundle, explorer_sheet, discovery_result)
             if kpi_blocks:
@@ -628,10 +666,12 @@ def _render_step_2() -> None:
                     new_kpi_overrides[wb_n] = kpis
             st.session_state[_SS_SOURCE_TAB_OVERRIDES] = new_src_overrides
             st.session_state["ar_kpi_tab_overrides"] = new_kpi_overrides
-            # Clear discovery + downstream so they re-run with new overrides
+            # Clear discovery + downstream; keep _SS_WB_ANALYSES so re-run is fast
             st.session_state.pop(_SS_DISCOVERY, None)
             st.session_state.pop(_SS_CONSOLIDATION, None)
             st.session_state.pop(_SS_SCHEMA, None)
+            st.session_state.pop(_SS_BLOCKS_CACHE, None)
+            st.session_state.pop(_SS_STRUCT_CACHE, None)
             st.session_state.pop(_SS_DISC_TAGS, None)
             st.rerun()
 

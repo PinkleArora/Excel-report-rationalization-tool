@@ -102,6 +102,7 @@ def _human_reasoning(tab_type: TabType, signals: dict) -> str:
 def run(
     bundles: list,
     overrides: dict[str, dict[str, str]] | None = None,
+    analyses: "list[WorkbookAnalysis] | None" = None,
 ) -> AgentResult:
     """Analyse every bundle and return a RationalizationConfig + AgentDecisions.
 
@@ -110,12 +111,17 @@ def run(
         overrides: Optional user overrides mapping
             ``{workbook_name: {"source_tab": "...", "kpi_tabs": ["..."]}}``
             Any value here takes precedence over the agent's recommendation.
+        analyses: Pre-computed WorkbookAnalysis list.  When supplied, the
+            expensive ``analyze_many`` call is skipped — the caller is
+            responsible for passing up-to-date analyses.  Pass ``None``
+            (default) to always re-analyse.
 
     Returns:
         AgentResult whose ``output`` is a :class:`RationalizationConfig`.
     """
     overrides = overrides or {}
-    analyses: list[WorkbookAnalysis] = analyze_many(bundles)
+    if analyses is None:
+        analyses = analyze_many(bundles)
     decisions: list[AgentDecision] = []
     warnings: list[str] = []
     wb_tab_configs: list[WorkbookTabConfig] = []
