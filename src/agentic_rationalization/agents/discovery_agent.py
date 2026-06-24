@@ -21,6 +21,14 @@ from src.agentic_rationalization.models import AgentDecision, AgentResult
 
 logger = logging.getLogger(__name__)
 
+
+def _get_pivot_infos_for_wb(analysis: WorkbookAnalysis):
+    """Return a list of (pivot_sheet, source_sheets) pairs for this workbook."""
+    return [
+        tab for tab in analysis.tab_analyses if tab.is_pivot_sheet
+    ]
+
+
 # Confidence is derived from the score gap between the winning TabType and the
 # runner-up.  A large gap → high confidence; a close contest → lower confidence.
 _HIGH_CONF_GAP = 1.5       # winning score this much ahead of runner-up → ≥ 0.90
@@ -115,6 +123,7 @@ def run(
     for analysis in analyses:
         wb_name = analysis.workbook_name
         wb_override = overrides.get(wb_name, {})
+        detection_type = analysis.detection_type()
 
         # Per-tab decisions
         tab_decisions: list[AgentDecision] = []
@@ -122,7 +131,17 @@ def run(
             if tab.tab_type in _SKIP_TYPES:
                 continue
 
-            conf = _score_gap_to_confidence(tab.signal_scores, tab.tab_type.value)
+            # Pivot-detected tabs get maximum confidence; signal-only tabs use gap heuristic
+            if tab.is_pivot_sheet:
+                conf = 0.99
+            elif tab.tab_type == TabType.SOURCE_DATA and any(
+                tab.tab_name in p.source_sheets
+                for p in _get_pivot_infos_for_wb(analysis)
+            ):
+                conf = 0.97  # pivot-traced source tab → very high confidence
+            else:
+                conf = _score_gap_to_confidence(tab.signal_scores, tab.tab_type.value)
+
             signals = {
                 "tab_type":              tab.tab_type.value,
                 "row_count":             tab.row_count,
@@ -131,18 +150,29 @@ def run(
                 "inter_sheet_refs":      tab.inter_sheet_ref_count,
                 "agg_func_count":        tab.formula_cell_count,
                 "referenced_sheets":     tab.referenced_sheets,
+                "is_pivot_sheet":        tab.is_pivot_sheet,
+                "pivot_source_tabs":     tab.pivot_source_tabs,
+                "pivot_value_fields":    tab.pivot_value_fields,
+                "detection_type":        detection_type,
             }
+            # Use pivot-aware reasoning when applicable; fall back to signal-based
+            if tab.classification_reason.startswith("PIVOT"):
+                reasoning = tab.classification_reason
+            else:
+                reasoning = _human_reasoning(tab.tab_type, signals)
+
             tab_decisions.append(AgentDecision(
                 subject=f"{wb_name} / {tab.tab_name}",
                 decision=tab.tab_type.value,
                 confidence=conf,
-                reasoning=_human_reasoning(tab.tab_type, signals),
+                reasoning=reasoning,
                 signals=signals,
             ))
 
         decisions.extend(tab_decisions)
 
-        # Determine source tab — highest-confidence SOURCE_DATA tab
+        # ── Source tab selection ─────────────────────────────────────────────
+        # Priority: user override > pivot-traced source > signal-based winner
         source_candidates = [
             d for d in tab_decisions if d.decision == TabType.SOURCE_DATA.value
         ]
@@ -159,7 +189,8 @@ def run(
                 "Please configure manually in Guided Rationalization."
             )
 
-        # Determine KPI tabs — all KPI_SUMMARY / DASHBOARD / OUTPUT tabs
+        # ── KPI tab selection ────────────────────────────────────────────────
+        # Priority: user override > pivot KPI tabs > formula-based KPI tabs
         kpi_candidates = [
             d for d in tab_decisions if d.decision in {t.value for t in _KPI_TYPES}
         ]

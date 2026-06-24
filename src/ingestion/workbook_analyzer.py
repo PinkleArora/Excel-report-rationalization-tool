@@ -153,6 +153,10 @@ class TabAnalysis:
     referenced_sheets: list[str] = field(default_factory=list)
     classification_reason: str = ""
     signal_scores: dict[str, float] = field(default_factory=dict)
+    # Pivot metadata — populated when sheet contains or feeds a pivot table
+    is_pivot_sheet: bool = False             # True when this sheet has pivot tables
+    pivot_source_tabs: list[str] = field(default_factory=list)   # sheets feeding this pivot
+    pivot_value_fields: list[str] = field(default_factory=list)  # measure/KPI field names
 
 
 @dataclass
@@ -212,6 +216,158 @@ class WorkbookAnalysis:
             types = {TabType.SOURCE_DATA, TabType.REFERENCE_DATA}
         return [t.tab_name for t in self.tab_analyses if t.tab_type in types]
 
+    @property
+    def pivot_kpi_tabs(self) -> list[str]:
+        """Sheets with pivot tables classified as KPI summary tabs."""
+        return [t.tab_name for t in self.tab_analyses if t.is_pivot_sheet]
+
+    @property
+    def all_pivot_value_fields(self) -> list[str]:
+        """All pivot value (measure) fields across all KPI tabs."""
+        fields: list[str] = []
+        for t in self.tab_analyses:
+            for f in t.pivot_value_fields:
+                if f not in fields:
+                    fields.append(f)
+        return fields
+
+    def detection_type(self) -> str:
+        """'Formula-Based' | 'Pivot-Based' | 'Mixed'."""
+        has_formula_kpi = any(
+            t.tab_type in (TabType.KPI_SUMMARY, TabType.DASHBOARD, TabType.OUTPUT)
+            and not t.is_pivot_sheet
+            for t in self.tab_analyses
+        )
+        has_pivot_kpi = any(t.is_pivot_sheet for t in self.tab_analyses)
+        if has_formula_kpi and has_pivot_kpi:
+            return "Mixed"
+        if has_pivot_kpi:
+            return "Pivot-Based"
+        return "Formula-Based"
+
+
+# ---------------------------------------------------------------------------
+# Pivot pre-scanner
+# ---------------------------------------------------------------------------
+
+_BUSINESS_MEASURE_WORDS = frozenset({
+    "reserve", "reserves", "count", "counts", "balance", "balances",
+    "premium", "premiums", "claim", "claims", "amount", "amounts",
+    "total", "sum", "net", "gross", "earned", "incurred", "paid",
+    "outstanding", "ibnr", "ulr", "loss", "expense", "exposure",
+    "policy", "policies", "rate", "fee", "revenue", "cost",
+    "quota", "share", "stat", "statutory", "gaap",
+})
+
+
+def _looks_like_measure(name: str) -> bool:
+    words = set(re.split(r"[\s_\-]+", name.lower()))
+    return bool(words & _BUSINESS_MEASURE_WORDS)
+
+
+@dataclass
+class _PivotInfo:
+    """Pivot table metadata extracted from a single sheet."""
+    sheet_name: str         # the sheet that contains the pivot table
+    source_sheets: list[str]
+    value_fields: list[str]
+    row_fields: list[str]
+    filter_fields: list[str]
+
+
+def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
+    """Read all pivot tables in a workbook via openpyxl metadata.
+
+    Returns one _PivotInfo per sheet that contains at least one pivot table.
+    Fields with no explicit dataField list are heuristically filtered for
+    business-measure keywords.
+    """
+    if raw_wb is None:
+        return []
+
+    infos: list[_PivotInfo] = []
+    for sheet_name in raw_wb.sheetnames:
+        try:
+            raw_ws = raw_wb[sheet_name]
+        except Exception:
+            continue
+        pivots = getattr(raw_ws, "_pivots", [])
+        if not pivots:
+            continue
+
+        source_sheets: list[str] = []
+        value_fields: list[str] = []
+        row_fields_raw: list[str] = []
+        filter_fields_raw: list[str] = []
+
+        for pv in pivots:
+            cache = getattr(pv, "cache", None)
+            if cache is not None:
+                ws_src = getattr(cache, "worksheetSource", None)
+                if ws_src is not None:
+                    src_sheet = getattr(ws_src, "sheet", "") or ""
+                    if src_sheet and src_sheet not in source_sheets:
+                        source_sheets.append(src_sheet)
+
+                # All field names in the cache
+                cache_fields: list[str] = [
+                    getattr(f, "name", None)
+                    for f in getattr(cache, "cacheFields", [])
+                    if getattr(f, "name", None)
+                ]
+            else:
+                cache_fields = []
+
+            # Value (data) fields
+            data_fields_obj = getattr(pv, "dataFields", None)
+            pv_value_fields: list[str] = []
+            if data_fields_obj is not None:
+                for df in getattr(data_fields_obj, "dataField", []):
+                    idx = getattr(df, "field", None)
+                    name = getattr(df, "name", None) or (
+                        cache_fields[idx] if idx is not None and 0 <= idx < len(cache_fields) else None
+                    )
+                    if name:
+                        pv_value_fields.append(name)
+
+            # Fallback: use business-measure heuristic on all cache fields
+            if not pv_value_fields:
+                pv_value_fields = [f for f in cache_fields if _looks_like_measure(f)]
+
+            for f in pv_value_fields:
+                if f not in value_fields:
+                    value_fields.append(f)
+
+            # Row fields
+            row_fields_obj = getattr(pv, "rowFields", None)
+            if row_fields_obj is not None:
+                for rf in getattr(row_fields_obj, "field", []):
+                    idx = getattr(rf, "x", None)
+                    if idx is not None and 0 <= idx < len(cache_fields):
+                        name = cache_fields[idx]
+                        if name and name not in row_fields_raw:
+                            row_fields_raw.append(name)
+
+            # Filter fields
+            pf_obj = getattr(pv, "pageFields", None)
+            if pf_obj is not None:
+                for pf in getattr(pf_obj, "pageField", []):
+                    idx = getattr(pf, "field", None)
+                    if idx is not None and 0 <= idx < len(cache_fields):
+                        name = cache_fields[idx]
+                        if name and name not in filter_fields_raw:
+                            filter_fields_raw.append(name)
+
+        infos.append(_PivotInfo(
+            sheet_name=sheet_name,
+            source_sheets=source_sheets,
+            value_fields=value_fields,
+            row_fields=row_fields_raw,
+            filter_fields=filter_fields_raw,
+        ))
+
+    return infos
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -242,6 +398,18 @@ def analyze_workbook(
         for sn, df in bundle.sheets.items()
     }
 
+    # ── Pivot pre-scan ───────────────────────────────────────────────────────
+    # Read all pivot tables BEFORE signal classification so we can override
+    # tab types with certainty: pivot sheets → KPI_SUMMARY, their source
+    # sheets → SOURCE_DATA (regardless of formula density or row count).
+    pivot_infos = _scan_pivots(raw_wb)
+    # pivot_by_sheet: sheet_name → _PivotInfo (for sheets that contain pivots)
+    pivot_by_sheet: dict[str, _PivotInfo] = {p.sheet_name: p for p in pivot_infos}
+    # sheets that are referenced as the data source by ≥1 pivot
+    pivot_source_sheet_names: set[str] = {
+        src for p in pivot_infos for src in p.source_sheets
+    }
+
     tab_analyses: list[TabAnalysis] = []
     kpi_definitions: list[KPIDefinition] = []
 
@@ -249,6 +417,47 @@ def analyze_workbook(
         raw_ws = _get_raw_ws(raw_wb, sheet_name)
         signals = _extract_signals(raw_ws, df)
         tab = _classify_tab(signals, sheet_name, wb_name, cfg)
+
+        # ── Pivot override ───────────────────────────────────────────────────
+        if sheet_name in pivot_by_sheet:
+            pinfo = pivot_by_sheet[sheet_name]
+            # A pivot sheet is a KPI summary tab — never source data
+            tab.tab_type = TabType.KPI_SUMMARY
+            tab.is_pivot_sheet = True
+            tab.pivot_source_tabs = pinfo.source_sheets
+            tab.pivot_value_fields = pinfo.value_fields
+            n_kpi = len(pinfo.value_fields)
+            src_str = ", ".join(pinfo.source_sheets) if pinfo.source_sheets else "unknown"
+            tab.classification_reason = (
+                f"PIVOT OVERRIDE: sheet contains pivot table(s) with {n_kpi} value "
+                f"field(s) — classified as KPI_SUMMARY. "
+                f"Pivot data source: [{src_str}]. "
+                f"KPI fields: {', '.join(pinfo.value_fields[:5])}"
+                + ("…" if n_kpi > 5 else "") + "."
+            )
+            logger.info(
+                "Pivot KPI tab detected: '%s/%s' — %d value field(s), source: %s",
+                wb_name, sheet_name, n_kpi, src_str,
+            )
+
+        elif sheet_name in pivot_source_sheet_names:
+            # A sheet that feeds a pivot is source data — even with formula cols
+            if tab.tab_type not in (TabType.SOURCE_DATA, TabType.REFERENCE_DATA):
+                tab.tab_type = TabType.SOURCE_DATA
+                consumers = [
+                    p.sheet_name for p in pivot_infos if sheet_name in p.source_sheets
+                ]
+                tab.classification_reason = (
+                    f"PIVOT SOURCE OVERRIDE: this sheet is the data source for pivot "
+                    f"table(s) on [{', '.join(consumers)}]. Classified as SOURCE_DATA. "
+                    f"Row count: {signals.row_count:,}, cols: {signals.col_count}. "
+                    + tab.classification_reason
+                )
+                logger.info(
+                    "Source tab promoted via pivot trace: '%s/%s' feeds pivot(s) on %s",
+                    wb_name, sheet_name, consumers,
+                )
+
         tab_analyses.append(tab)
         logger.debug(
             "Tab '%s/%s' → %s  (formula_density=%.2f, inter_sheet=%d, "

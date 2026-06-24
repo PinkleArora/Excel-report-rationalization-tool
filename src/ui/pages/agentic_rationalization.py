@@ -418,60 +418,93 @@ def _render_step_2() -> None:
                     row_count   = fp.row_count
                     col_count   = fp.column_count
 
+        # Source tab and KPI tab confidence
+        src_conf_icon = _conf_color(tab_conf)
+        src_conf_pct  = f"{tab_conf:.0%}" if tab_conf > 0 else "—"
+        low_conf_src  = tab_conf > 0 and tab_conf < 0.85
+
+        kpi_tab_confs: dict[str, float] = {}
+        for d in discovery_result.decisions:
+            for kt in kpi_tabs:
+                if d.subject == f"{fname} / {kt}":
+                    kpi_tab_confs[kt] = d.confidence
+        kpi_conf_avg = sum(kpi_tab_confs.values()) / len(kpi_tab_confs) if kpi_tab_confs else 0.0
+        kpi_conf_icon = _conf_color(kpi_conf_avg) if kpi_conf_avg > 0 else "⚪"
+        low_conf_kpi  = kpi_conf_avg > 0 and kpi_conf_avg < 0.85
+
+        # Detection type inferred from decisions (read-only — not user-configurable)
+        _DT_ICONS = {"Formula-Based": "🧮", "Pivot-Based": "🔄", "Mixed": "⚡"}
+        src_decision = next(
+            (d for d in discovery_result.decisions if d.subject == f"{fname} / {source_tab}"),
+            None,
+        )
+        detection_type = (
+            src_decision.signals.get("detection_type", "Formula-Based")
+            if src_decision and src_decision.signals else "Formula-Based"
+        )
+        # Also check KPI tab decisions for pivot signals
+        for kt in kpi_tabs:
+            kd = next((d for d in discovery_result.decisions if d.subject == f"{fname} / {kt}"), None)
+            if kd and kd.signals:
+                if kd.signals.get("is_pivot_sheet"):
+                    detection_type = "Pivot-Based" if detection_type == "Formula-Based" else "Mixed"
+                    break
+        dt_icon = _DT_ICONS.get(detection_type, "🧮")
+
+        # KPI count from discovery signals
+        kpi_count = sum(
+            len(d.signals.get("pivot_value_fields", []))
+            for d in discovery_result.decisions
+            if d.subject.startswith(f"{fname} / ") and d.signals.get("is_pivot_sheet")
+        )
+
+        # Reasoning text for WHY panel
+        src_reasoning = src_decision.reasoning if src_decision else "—"
+        kpi_reasonings: list[str] = []
+        for kt in kpi_tabs:
+            kd = next((d for d in discovery_result.decisions if d.subject == f"{fname} / {kt}"), None)
+            if kd:
+                kpi_reasonings.append(f"**`{kt}`**: {kd.reasoning}")
+
         with st.container(border=True):
             st.markdown(f"**📁 {fname}**")
 
-            # Source tab confidence
-            src_conf_icon = _conf_color(tab_conf)
-            src_conf_pct  = f"{tab_conf:.0%}" if tab_conf > 0 else "—"
-            low_conf_src  = tab_conf > 0 and tab_conf < 0.85
+            # ── Discovery Validation Panel ─────────────────────────────────
+            vm1, vm2, vm3, vm4, vm5, vm6 = st.columns(6)
+            vm1.metric("Source Tab", source_tab)
+            vm2.metric("KPI Tab(s)", len(kpi_tabs))
+            vm3.metric(f"{dt_icon} Detection", detection_type)
+            vm4.metric("Grain", grain_label if grain_label != "—" else "Pending")
+            vm5.metric("KPI Count", kpi_count if kpi_count else "Pending")
+            vm6.metric("Confidence", src_conf_pct)
 
-            # Find KPI tab confidence
-            kpi_tab_confs: dict[str, float] = {}
-            for d in discovery_result.decisions:
-                for kt in kpi_tabs:
-                    if d.subject == f"{fname} / {kt}":
-                        kpi_tab_confs[kt] = d.confidence
-            kpi_conf_avg = sum(kpi_tab_confs.values()) / len(kpi_tab_confs) if kpi_tab_confs else 0.0
-            kpi_conf_icon = _conf_color(kpi_conf_avg) if kpi_conf_avg > 0 else "⚪"
-            low_conf_kpi  = kpi_conf_avg > 0 and kpi_conf_avg < 0.85
-
-            # Detect current detection type from previous KPI run if available
-            kpi_result_obj_step2: AgentResult | None = st.session_state.get(_SS_KPI)
-            kpi_analysis_step2 = kpi_result_obj_step2.output if kpi_result_obj_step2 else None
-            dt_map_step2 = getattr(kpi_analysis_step2, "detection_types", {}) if kpi_analysis_step2 else {}
-            dt_overrides = st.session_state.get("ar_detection_type_overrides", {})
-            current_detection_type = dt_overrides.get(fname) or dt_map_step2.get(fname, "Formula-Based")
-            _DT_OPTIONS = ["Formula-Based", "Pivot-Based", "Mixed"]
-            _DT_ICONS   = {"Formula-Based": "🧮", "Pivot-Based": "🔄", "Mixed": "⚡"}
-
-            r1c1, r1c2, r1c3, r1c4 = st.columns([2, 2, 1, 1])
-            with r1c1:
-                st.markdown(f"**Source Tab:** `{source_tab}` {src_conf_icon} {src_conf_pct}")
+            if low_conf_src or low_conf_kpi or not kpi_tabs:
                 if low_conf_src:
-                    st.caption("⚠️ Low confidence — consider overriding")
-            with r1c2:
-                kpi_str = ", ".join(f"`{t}`" for t in kpi_tabs) if kpi_tabs else "*(none detected)*"
-                st.markdown(f"**KPI Tab(s):** {kpi_str} {kpi_conf_icon}")
+                    st.warning(f"⚠️ Source tab confidence is {src_conf_pct} — consider overriding")
                 if not kpi_tabs:
-                    st.caption("⚠️ No KPI tabs found — may be pivot-based")
+                    st.warning("⚠️ No KPI tabs detected — check if workbook uses pivot tables")
                 elif low_conf_kpi:
-                    st.caption("⚠️ Low confidence KPI tab identification")
-            with r1c3:
-                dt_icon = _DT_ICONS.get(current_detection_type, "🧮")
-                st.markdown(f"**Detection:** {dt_icon} `{current_detection_type}`")
-            with r1c4:
-                if row_count:
-                    st.caption(f"**{row_count:,}** rows")
-                    st.caption(f"Grain: {grain_label}")
+                    st.warning(f"⚠️ KPI tab confidence is {kpi_conf_avg:.0%} — consider overriding")
 
-            # Source/KPI tab + Detection Type override
+            # WHY panel
+            with st.expander("Why was this classified this way?", expanded=False):
+                st.markdown(f"**Source Tab = `{source_tab}`**")
+                st.caption(src_reasoning)
+                if kpi_reasonings:
+                    st.markdown("**KPI Tab(s):**")
+                    for r in kpi_reasonings:
+                        st.caption(r)
+                if not kpi_reasonings and kpi_tabs:
+                    st.caption("KPI tab reasoning not available.")
+
+            # ── Override: Source Tab + KPI Tab only ───────────────────────
             if all_sheets:
                 with st.expander(
-                    f"Override source/KPI tab for `{fname}`",
+                    f"Override for `{fname}`",
                     expanded=low_conf_src or low_conf_kpi or not kpi_tabs,
                 ):
-                    ov_c1, ov_c2, ov_c3 = st.columns(3)
+                    st.caption("Detection Type is inferred automatically and cannot be overridden.")
+                    ov_c1, ov_c2 = st.columns(2)
                     with ov_c1:
                         default_idx = all_sheets.index(source_tab) if source_tab in all_sheets else 0
                         new_tab = st.selectbox(
@@ -498,19 +531,6 @@ def _render_step_2() -> None:
                             kpi_overrides = st.session_state.get("ar_kpi_tab_overrides", {})
                             kpi_overrides[fname] = new_kpi_tabs
                             st.session_state["ar_kpi_tab_overrides"] = kpi_overrides
-                            changed = True
-                    with ov_c3:
-                        dt_default_idx = _DT_OPTIONS.index(current_detection_type) if current_detection_type in _DT_OPTIONS else 0
-                        new_dt = st.selectbox(
-                            "Detection type:",
-                            _DT_OPTIONS,
-                            index=dt_default_idx,
-                            key=f"ar_det_type_{fname}",
-                            help="Formula-Based: SUMIFS/COUNTIFS/etc. | Pivot-Based: pivot tables | Mixed: both",
-                        )
-                        if new_dt != current_detection_type:
-                            dt_overrides[fname] = new_dt
-                            st.session_state["ar_detection_type_overrides"] = dt_overrides
                             changed = True
 
     if changed:
