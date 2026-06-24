@@ -432,28 +432,56 @@ def analyze_kpi_dependencies(
             pivots = getattr(raw_ws, "_pivots", [])
             if not pivots:
                 continue
-            # Check if any pivot references the source tab
+            # Check if any pivot references the source tab.
+            # Three strategies mirror workbook_analyzer._scan_pivots():
+            # 1. worksheetSource.sheet == source_tab  (explicit)
+            # 2. worksheetSource.name → defined-names lookup
+            # 3. cache-field overlap with source tab headers (fallback)
             references_source = False
             for pv in pivots:
                 cache = getattr(pv, "cache", None)
+                if cache is None:
+                    continue
                 ws_source = getattr(cache, "worksheetSource", None)
                 if ws_source is not None:
-                    ref_sheet = getattr(ws_source, "sheet", "") or ""
+                    ref_sheet = getattr(ws_source, "sheet", None) or ""
                     if ref_sheet == source_tab:
                         references_source = True
                         break
-                # Fallback: pivot cache name contains source tab name
-                cache_name = getattr(cache, "refreshedBy", "") or getattr(cache, "id", "")
-                if source_tab.lower() in str(cache_name).lower():
-                    references_source = True
-                    break
-            if not references_source:
-                # Still try extraction — if it yields business measures, include them
-                piv = _extract_pivot_kpis(raw_wb, sheet_name, source_tab, source_headers, bundle.file_name)
-                if piv:
-                    pivot_deps.extend(piv)
-            else:
-                piv = _extract_pivot_kpis(raw_wb, sheet_name, source_tab, source_headers, bundle.file_name)
+                    # Strategy 2: named range
+                    named = getattr(ws_source, "name", None) or ""
+                    if named and raw_wb is not None:
+                        for dn_key in getattr(raw_wb, "defined_names", {}):
+                            if dn_key == named:
+                                dn_val = raw_wb.defined_names[dn_key]
+                                for dest_sheet, _ in getattr(dn_val, "destinations", []):
+                                    if dest_sheet == source_tab:
+                                        references_source = True
+                                break
+                    if references_source:
+                        break
+
+            # Strategy 3: cache-field overlap with source tab column headers
+            if not references_source and source_headers:
+                source_lower = {str(h).lower() for h in source_headers if h}
+                for pv in pivots:
+                    cache = getattr(pv, "cache", None)
+                    if cache is None:
+                        continue
+                    cache_fields_here = [
+                        getattr(f, "name", None)
+                        for f in getattr(cache, "cacheFields", [])
+                        if getattr(f, "name", None)
+                    ]
+                    overlap = sum(
+                        1 for cf in cache_fields_here if cf.lower() in source_lower
+                    )
+                    if overlap >= 2:
+                        references_source = True
+                        break
+
+            piv = _extract_pivot_kpis(raw_wb, sheet_name, source_tab, source_headers, bundle.file_name)
+            if piv:
                 pivot_deps.extend(piv)
 
             if pivot_deps and sheet_name not in wb_cfg.kpi_tabs:

@@ -295,12 +295,52 @@ class _PivotInfo:
     filter_fields: list[str]
 
 
+def _find_source_by_cache_fields(
+    raw_wb: Any,
+    cache_fields: list[str],
+    pivot_sheet: str,
+    min_overlap: int = 2,
+) -> str:
+    """Heuristic fallback: find the sheet whose column headers best match
+    the pivot cache field names.  Used when worksheetSource.sheet is absent.
+
+    Returns the sheet name with the highest overlap, or "" if no candidate
+    reaches ``min_overlap`` matching fields.
+    """
+    if raw_wb is None or not cache_fields:
+        return ""
+    cache_lower = {f.lower() for f in cache_fields if f}
+    best_sheet = ""
+    best_overlap = 0
+    for sn in raw_wb.sheetnames:
+        if sn == pivot_sheet:
+            continue
+        try:
+            ws = raw_wb[sn]
+            first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            if not first_row:
+                continue
+            col_names = {str(v).lower() for v in first_row if v is not None}
+            overlap = len(cache_lower & col_names)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_sheet = sn
+        except Exception:
+            continue
+    return best_sheet if best_overlap >= min_overlap else ""
+
+
 def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
     """Read all pivot tables in a workbook via openpyxl metadata.
 
     Returns one _PivotInfo per sheet that contains at least one pivot table.
     Fields with no explicit dataField list are heuristically filtered for
     business-measure keywords.
+
+    Source sheet detection uses three strategies in order:
+    1. ``cache.worksheetSource.sheet`` — the explicit sheet name (most reliable).
+    2. ``cache.worksheetSource.name`` → workbook defined-names lookup.
+    3. Cache-field name matching against every other sheet's column headers.
     """
     if raw_wb is None:
         return []
@@ -319,15 +359,28 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
         value_fields: list[str] = []
         row_fields_raw: list[str] = []
         filter_fields_raw: list[str] = []
+        all_cache_fields: list[str] = []   # accumulated across all pivots on this sheet
 
         for pv in pivots:
             cache = getattr(pv, "cache", None)
             if cache is not None:
                 ws_src = getattr(cache, "worksheetSource", None)
                 if ws_src is not None:
-                    src_sheet = getattr(ws_src, "sheet", "") or ""
+                    # Strategy 1: explicit sheet attribute
+                    src_sheet = getattr(ws_src, "sheet", None) or ""
                     if src_sheet and src_sheet not in source_sheets:
                         source_sheets.append(src_sheet)
+                    else:
+                        # Strategy 2: named range — resolve via workbook defined names
+                        named = getattr(ws_src, "name", None) or ""
+                        if named:
+                            for dn_key in getattr(raw_wb, "defined_names", {}):
+                                if dn_key == named:
+                                    dn_val = raw_wb.defined_names[dn_key]
+                                    for dest_sheet, _ in getattr(dn_val, "destinations", []):
+                                        if dest_sheet and dest_sheet not in source_sheets:
+                                            source_sheets.append(dest_sheet)
+                                    break
 
                 # All field names in the cache
                 cache_fields: list[str] = [
@@ -335,6 +388,9 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
                     for f in getattr(cache, "cacheFields", [])
                     if getattr(f, "name", None)
                 ]
+                for cf in cache_fields:
+                    if cf not in all_cache_fields:
+                        all_cache_fields.append(cf)
             else:
                 cache_fields = []
 
@@ -377,6 +433,23 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
                         name = cache_fields[idx]
                         if name and name not in filter_fields_raw:
                             filter_fields_raw.append(name)
+
+        # Strategy 3: if no source sheet found yet, match cache fields against
+        # all other sheets' column headers to find the best candidate.
+        if not source_sheets and all_cache_fields:
+            fallback = _find_source_by_cache_fields(raw_wb, all_cache_fields, sheet_name)
+            if fallback:
+                source_sheets.append(fallback)
+                logger.info(
+                    "Pivot source fallback: '%s' matched to '%s' via cache-field overlap",
+                    sheet_name, fallback,
+                )
+            else:
+                logger.warning(
+                    "Pivot on '%s': could not identify source sheet "
+                    "(worksheetSource.sheet absent and no cache-field match found)",
+                    sheet_name,
+                )
 
         infos.append(_PivotInfo(
             sheet_name=sheet_name,
