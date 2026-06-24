@@ -970,48 +970,204 @@ def _render_step_3() -> None:
     _OVERRIDE_OPEN_KEY = "ar_consol_override_open"
     override_open: set = st.session_state.setdefault(_OVERRIDE_OPEN_KEY, set())
 
-    consolidate_groups = [g for g in effective_groups if g.recommendation == "Consolidate" and len(g.file_names) > 1]
-    separate_groups    = [g for g in effective_groups if g.recommendation != "Consolidate" or len(g.file_names) == 1]
-    discard_files      = [r for r in kpi_redundancy if r.recommendation == "Discard"]
-    discard_names: set[str] = {r.file_name for r in discard_files}
+    # ── Build governance recommendations (KPI-driven) ────────────────────────
+    redundancy_map = {r.file_name: r for r in kpi_redundancy}
+
+    def _kpi_coverage_pct(fname: str) -> float:
+        r = redundancy_map.get(fname)
+        if r is None or r.total_kpi_columns == 0:
+            return 0.0
+        shared = r.total_kpi_columns - r.unique_kpi_columns
+        return round(shared / r.total_kpi_columns * 100, 1)
+
+    def _kpi_uniqueness_pct(fname: str) -> float:
+        r = redundancy_map.get(fname)
+        if r is None or r.total_kpi_columns == 0:
+            return 100.0
+        return round(r.unique_kpi_columns / r.total_kpi_columns * 100, 1)
+
+    # Decommission: fully redundant files (all KPIs exist elsewhere)
+    decommission_names: set[str] = {r.file_name for r in kpi_redundancy if r.redundant}
+
+    # Consolidation groups: multi-file groups excluding decommissioned files
+    consol_groups = [
+        g for g in effective_groups
+        if g.recommendation == "Consolidate" and len(g.file_names) > 1
+    ]
+
+    # Within each consolidation group find canonical (most KPI cols) and
+    # non-canonical files → CONSOLIDATE & MERGE
+    canonical_names: set[str] = set()
+    merge_entries: list[dict] = []  # {fname, canonical_fname, group}
+    keep_certify_from_groups: list[dict] = []  # {fname, group}
+
+    for group in consol_groups:
+        active_files = [f for f in group.file_names if f not in decommission_names]
+        if not active_files:
+            continue
+        canonical = max(
+            active_files,
+            key=lambda f: (redundancy_map[f].total_kpi_columns if f in redundancy_map else 0),
+        )
+        canonical_names.add(canonical)
+        keep_certify_from_groups.append({"file_name": canonical, "group": group})
+        for fname in active_files:
+            if fname != canonical:
+                merge_entries.append({"file_name": fname, "canonical": canonical, "group": group})
+
+    # Files not in any multi-file consolidation group and not decommissioned → KEEP & CERTIFY
+    grouped_files: set[str] = set()
+    for group in consol_groups:
+        grouped_files |= set(group.file_names)
+
+    standalone_keep: list[str] = [
+        fp.file_name for fp in intel.file_profiles
+        if fp.file_name not in grouped_files and fp.file_name not in decommission_names
+    ]
+
+    keep_certify_files = [e["file_name"] for e in keep_certify_from_groups] + standalone_keep
+    decommission_list  = [r for r in kpi_redundancy if r.redundant]
 
     # ── Summary bar ──────────────────────────────────────────────────────────
     s1, s2, s3 = st.columns(3)
-    s1.metric("Consolidate", len(consolidate_groups), help="Groups of files that can be merged")
-    s2.metric("Discard",     len(discard_files),      help="Files whose KPIs are fully covered by others")
-    s3.metric("Keep Separate", len(separate_groups),  help="Files with unique content that must remain independent")
+    s1.metric("Keep & Certify",      len(keep_certify_files),  help="Canonical workbooks — retain as authoritative sources")
+    s2.metric("Consolidate & Merge", len(merge_entries),        help="Files whose KPIs are covered by a canonical workbook")
+    s3.metric("Decommission",        len(decommission_list),    help="Fully redundant files — all KPIs exist elsewhere")
 
     st.markdown("---")
 
-    # ── CONSOLIDATE cards ────────────────────────────────────────────────────
-    if consolidate_groups:
-        st.markdown("### Consolidate")
-        for group in consolidate_groups:
-            card_key = f"group_{group.group_id}"
+    # ── KEEP & CERTIFY ───────────────────────────────────────────────────────
+    if keep_certify_files:
+        st.markdown("### Keep & Certify")
+        st.caption("These workbooks are the authoritative sources for their KPI domains.")
+        for fname in keep_certify_files:
+            card_key  = f"gov_keep_{fname}"
             is_accepted = card_key in accepted
-            is_override = card_key in override_open
+            coverage  = _kpi_coverage_pct(fname)
+            uniqueness = _kpi_uniqueness_pct(fname)
+            r = redundancy_map.get(fname)
+            total_kpis = r.total_kpi_columns if r else 0
 
             with st.container(border=True):
-                st.markdown(f"#### {'✅ ' if is_accepted else ''}Recommendation: CONSOLIDATE")
-                st.markdown("**Files:**")
-                for fname in group.file_names:
-                    st.markdown(f"- {fname}")
+                h1, h2 = st.columns([3, 1])
+                with h1:
+                    st.markdown(
+                        f"{'✅ ' if is_accepted else ''}**{fname}**  "
+                        f"<span style='background:#d4edda;color:#155724;padding:2px 8px;"
+                        f"border-radius:4px;font-size:0.85em;'>KEEP & CERTIFY</span>",
+                        unsafe_allow_html=True,
+                    )
+                with h2:
+                    st.metric("Total KPIs", total_kpis)
 
-                st.markdown(f"**Reason:** {group.reasoning}")
+                mc1, mc2 = st.columns(2)
+                mc1.metric("KPI Coverage",   f"{coverage:.0f}%",   help="% of KPIs shared with at least one other file")
+                mc2.metric("KPI Uniqueness", f"{uniqueness:.0f}%", help="% of KPIs found only in this file")
 
-                kpis = _kpis_for_group(group.file_names, kpi_alignments)
-                if kpis:
-                    st.markdown("**KPIs Covered:**")
-                    for kpi in kpis:
+                # Governance rationale
+                if uniqueness >= 70:
+                    rationale = (
+                        f"This workbook owns {uniqueness:.0f}% of its KPIs exclusively — "
+                        "no other file covers this domain. Retain as the canonical source."
+                    )
+                elif fname in canonical_names:
+                    rationale = (
+                        f"Designated canonical within its consolidation group: "
+                        f"broadest KPI set ({total_kpis} KPIs) and highest coverage breadth."
+                    )
+                else:
+                    rationale = (
+                        f"Standalone workbook with {total_kpis} KPIs. "
+                        "No overlap sufficient to justify merging into another file."
+                    )
+                st.markdown(f"**Governance Rationale:** {rationale}")
+
+                common_kpis = _kpis_for_group(
+                    [fname] + [e["file_name"] for e in merge_entries if e["canonical"] == fname],
+                    kpi_alignments,
+                )
+                if common_kpis:
+                    st.markdown("**Common KPIs:**")
+                    for kpi in common_kpis:
                         st.markdown(f"- {kpi}")
-                    if len(kpis) == 8:
+                    if len(common_kpis) == 8:
                         st.caption("(showing first 8 — see View Analysis for full list)")
+
+                if st.button(
+                    "✅ Accept" if not is_accepted else "✅ Accepted",
+                    key=f"accept_{card_key}",
+                    type="primary" if not is_accepted else "secondary",
+                ):
+                    accepted.add(card_key)
+                    st.session_state[_ACCEPTED_KEY] = accepted
+                    st.rerun()
+
+        st.markdown("---")
+
+    # ── CONSOLIDATE & MERGE ──────────────────────────────────────────────────
+    if merge_entries:
+        st.markdown("### Consolidate & Merge")
+        st.caption("These workbooks can be merged into a canonical file — their KPIs are substantially covered by the target.")
+        for entry in merge_entries:
+            fname     = entry["file_name"]
+            canonical = entry["canonical"]
+            card_key  = f"gov_merge_{fname}"
+            is_accepted = card_key in accepted
+            is_override = card_key in override_open
+            coverage   = _kpi_coverage_pct(fname)
+            uniqueness = _kpi_uniqueness_pct(fname)
+            r = redundancy_map.get(fname)
+            total_kpis = r.total_kpi_columns if r else 0
+
+            with st.container(border=True):
+                h1, h2 = st.columns([3, 1])
+                with h1:
+                    st.markdown(
+                        f"{'✅ ' if is_accepted else ''}**{fname}**  "
+                        f"<span style='background:#fff3cd;color:#856404;padding:2px 8px;"
+                        f"border-radius:4px;font-size:0.85em;'>CONSOLIDATE & MERGE</span>",
+                        unsafe_allow_html=True,
+                    )
+                with h2:
+                    st.metric("Total KPIs", total_kpis)
+
+                st.markdown(f"**Merge Into:** `{canonical}`")
+
+                mc1, mc2 = st.columns(2)
+                mc1.metric("KPI Coverage",   f"{coverage:.0f}%",   help="% of KPIs shared with the target file")
+                mc2.metric("KPI Uniqueness", f"{uniqueness:.0f}%", help="% of KPIs found only in this file")
+
+                if coverage >= 80:
+                    rationale = (
+                        f"{coverage:.0f}% of this workbook's KPIs are already present in `{canonical}`. "
+                        "Merge to eliminate duplication and consolidate reporting."
+                    )
+                else:
+                    rationale = (
+                        f"Significant KPI overlap ({coverage:.0f}%) with `{canonical}`. "
+                        f"The {uniqueness:.0f}% unique KPIs should be migrated before decommissioning."
+                    )
+                st.markdown(f"**Governance Rationale:** {rationale}")
+
+                common_kpis = _kpis_for_group([fname, canonical], kpi_alignments)
+                if common_kpis:
+                    st.markdown("**Common KPIs:**")
+                    for kpi in common_kpis:
+                        st.markdown(f"- {kpi}")
+                    if len(common_kpis) == 8:
+                        st.caption("(showing first 8 — see View Analysis for full list)")
+
+                unique_kpis = _unique_kpis_for_file(fname, file_names, kpi_alignments)
+                if unique_kpis:
+                    st.markdown("**Unique KPIs (must migrate before merge):**")
+                    for kpi in unique_kpis:
+                        st.markdown(f"- {kpi}")
 
                 if not is_override:
                     ba, bb = st.columns([1, 1])
                     with ba:
                         if st.button(
-                            "✅ Accept Recommendation" if not is_accepted else "✅ Accepted",
+                            "✅ Accept" if not is_accepted else "✅ Accepted",
                             key=f"accept_{card_key}",
                             type="primary" if not is_accepted else "secondary",
                         ):
@@ -1019,39 +1175,32 @@ def _render_step_3() -> None:
                             st.session_state[_ACCEPTED_KEY] = accepted
                             st.rerun()
                     with bb:
-                        if st.button("✏️ Override", key=f"override_open_{card_key}"):
+                        if st.button("✏️ Override Target", key=f"override_open_{card_key}"):
                             override_open.add(card_key)
                             st.session_state[_OVERRIDE_OPEN_KEY] = override_open
                             st.rerun()
                 else:
-                    # ── Inline override form ──────────────────────────────────
-                    st.markdown("**Override — reassign files to groups:**")
-                    group_ids   = sorted({g.group_id for g in intel.groups})
-                    max_gid     = max(group_ids) if group_ids else 0
-                    for fname in file_names:
-                        current_gid = next((g.group_id for g in intel.groups if fname in g.file_names), 0)
-                        override_val = group_overrides.get(fname, current_gid)
-                        options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_gid + 1}", "Exclude"]
-                        options_ids    = group_ids + [max_gid + 1, None]
-                        safe_val = override_val if override_val in options_ids else current_gid
-                        current_idx = options_ids.index(safe_val) if safe_val in options_ids else 0
-                        fc1, fc2 = st.columns([3, 2])
-                        with fc1:
-                            st.markdown(f"`{fname}`")
-                        with fc2:
-                            chosen_label = st.selectbox(
-                                "Group",
-                                options_labels,
-                                index=current_idx,
-                                key=f"grp_ov_{card_key}_{fname}",
-                                label_visibility="collapsed",
-                            )
-                            new_gid = options_ids[options_labels.index(chosen_label)]
-                            group_overrides[fname] = new_gid
-
-                    oa, ob = st.columns([1, 1])
+                    st.markdown("**Override — reassign merge target:**")
+                    group_ids      = sorted({g.group_id for g in intel.groups})
+                    max_gid        = max(group_ids) if group_ids else 1
+                    options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_gid + 1}", "Keep Separate"]
+                    options_ids    = group_ids + [max_gid + 1, None]
+                    current_gid    = next((g.group_id for g in intel.groups if fname in g.file_names), group_ids[0] if group_ids else 0)
+                    override_val   = group_overrides.get(fname, current_gid)
+                    safe_val       = override_val if override_val in options_ids else current_gid
+                    current_idx    = options_ids.index(safe_val) if safe_val in options_ids else 0
+                    chosen_label   = st.selectbox(
+                        "Assign to",
+                        options_labels,
+                        index=current_idx,
+                        key=f"grp_ov_merge_{fname}",
+                        label_visibility="collapsed",
+                    )
+                    new_gid = options_ids[options_labels.index(chosen_label)]
+                    oa, ob  = st.columns([1, 1])
                     with oa:
                         if st.button("Apply", key=f"override_apply_{card_key}", type="primary"):
+                            group_overrides[fname] = new_gid
                             st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
                             override_open.discard(card_key)
                             st.session_state[_OVERRIDE_OPEN_KEY] = override_open
@@ -1064,31 +1213,48 @@ def _render_step_3() -> None:
 
         st.markdown("---")
 
-    # ── DISCARD cards ────────────────────────────────────────────────────────
-    if discard_files:
-        st.markdown("### Discard")
-        for r in discard_files:
-            card_key = f"discard_{r.file_name}"
+    # ── DECOMMISSION ─────────────────────────────────────────────────────────
+    if decommission_list:
+        st.markdown("### Decommission")
+        st.caption("These workbooks are fully redundant — every KPI they contain already exists in another file.")
+        for r in decommission_list:
+            card_key   = f"gov_decomm_{r.file_name}"
             is_accepted = card_key in accepted
             is_override = card_key in override_open
+            coverage    = _kpi_coverage_pct(r.file_name)
+            uniqueness  = _kpi_uniqueness_pct(r.file_name)
 
             with st.container(border=True):
-                st.markdown(f"#### {'✅ ' if is_accepted else ''}Recommendation: DISCARD")
-                st.markdown(f"**File:** {r.file_name}")
-                st.markdown(f"**Reason:** {r.reason}")
-
-                st.markdown("**Unique KPIs:** None")
+                h1, h2 = st.columns([3, 1])
+                with h1:
+                    st.markdown(
+                        f"{'✅ ' if is_accepted else ''}**{r.file_name}**  "
+                        f"<span style='background:#f8d7da;color:#721c24;padding:2px 8px;"
+                        f"border-radius:4px;font-size:0.85em;'>DECOMMISSION</span>",
+                        unsafe_allow_html=True,
+                    )
+                with h2:
+                    st.metric("Total KPIs", r.total_kpi_columns)
 
                 if r.covered_by:
-                    st.markdown(
-                        "**Covered By:** " + ", ".join(f"`{f}`" for f in r.covered_by)
-                    )
+                    st.markdown("**Covered By:** " + ", ".join(f"`{f}`" for f in r.covered_by))
+
+                mc1, mc2 = st.columns(2)
+                mc1.metric("KPI Coverage",   f"{coverage:.0f}%",   help="% of KPIs shared with other files")
+                mc2.metric("KPI Uniqueness", f"{uniqueness:.0f}%", help="% of KPIs found only in this file")
+
+                rationale = (
+                    f"All {r.total_kpi_columns} KPIs in this workbook are already present in "
+                    + (", ".join(f"`{f}`" for f in r.covered_by) if r.covered_by else "other files")
+                    + ". Decommission to remove duplication from the reporting estate."
+                )
+                st.markdown(f"**Governance Rationale:** {rationale}")
 
                 if not is_override:
                     ba, bb = st.columns([1, 1])
                     with ba:
                         if st.button(
-                            "✅ Accept Recommendation" if not is_accepted else "✅ Accepted",
+                            "✅ Accept" if not is_accepted else "✅ Accepted",
                             key=f"accept_{card_key}",
                             type="primary" if not is_accepted else "secondary",
                         ):
@@ -1101,117 +1267,22 @@ def _render_step_3() -> None:
                             st.session_state[_OVERRIDE_OPEN_KEY] = override_open
                             st.rerun()
                 else:
-                    st.markdown("**Override — assign to a group instead of discarding:**")
-                    group_ids    = sorted({g.group_id for g in intel.groups})
-                    max_gid      = max(group_ids) if group_ids else 1
+                    st.markdown("**Override — assign to a consolidation group instead:**")
+                    group_ids      = sorted({g.group_id for g in intel.groups})
+                    max_gid        = max(group_ids) if group_ids else 1
                     options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_gid + 1}"]
                     options_ids    = group_ids + [max_gid + 1]
-                    chosen_label = st.selectbox(
+                    chosen_label   = st.selectbox(
                         "Assign to group:",
                         options_labels,
-                        key=f"grp_ov_discard_{r.file_name}",
+                        key=f"grp_ov_decomm_{r.file_name}",
                         label_visibility="collapsed",
                     )
                     new_gid = options_ids[options_labels.index(chosen_label)]
-                    oa, ob = st.columns([1, 1])
+                    oa, ob  = st.columns([1, 1])
                     with oa:
                         if st.button("Apply", key=f"override_apply_{card_key}", type="primary"):
                             group_overrides[r.file_name] = new_gid
-                            st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
-                            override_open.discard(card_key)
-                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
-                            st.rerun()
-                    with ob:
-                        if st.button("Cancel", key=f"override_cancel_{card_key}"):
-                            override_open.discard(card_key)
-                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
-                            st.rerun()
-
-        st.markdown("---")
-
-    # ── KEEP SEPARATE cards ──────────────────────────────────────────────────
-    keep_sep = [g for g in separate_groups if not all(fn in discard_names for fn in g.file_names)]
-    if keep_sep:
-        st.markdown("### Keep Separate")
-        for group in keep_sep:
-            # For single-file groups show the file name as the heading
-            card_key = f"group_{group.group_id}"
-            is_accepted = card_key in accepted
-            is_override = card_key in override_open
-
-            with st.container(border=True):
-                st.markdown(f"#### {'✅ ' if is_accepted else ''}Recommendation: KEEP SEPARATE")
-                if len(group.file_names) == 1:
-                    st.markdown(f"**File:** {group.file_names[0]}")
-                else:
-                    st.markdown("**Files:**")
-                    for fname in group.file_names:
-                        st.markdown(f"- {fname}")
-
-                st.markdown(f"**Reason:** {group.reasoning or 'Contains unique KPIs not found in any other file.'}")
-
-                # Unique KPIs — aggregate per file for the group
-                unique_kpis: list[str] = []
-                for fname in group.file_names:
-                    unique_kpis.extend(
-                        k for k in _unique_kpis_for_file(fname, file_names, kpi_alignments)
-                        if k not in unique_kpis
-                    )
-                unique_kpis = unique_kpis[:8]
-                if unique_kpis:
-                    st.markdown("**Unique KPIs:**")
-                    for kpi in unique_kpis:
-                        st.markdown(f"- {kpi}")
-                else:
-                    st.markdown("**Unique KPIs:** —")
-
-                if group.incompatibility_detail:
-                    st.caption(group.incompatibility_detail)
-
-                if not is_override:
-                    ba, bb = st.columns([1, 1])
-                    with ba:
-                        if st.button(
-                            "✅ Accept Recommendation" if not is_accepted else "✅ Accepted",
-                            key=f"accept_{card_key}",
-                            type="primary" if not is_accepted else "secondary",
-                        ):
-                            accepted.add(card_key)
-                            st.session_state[_ACCEPTED_KEY] = accepted
-                            st.rerun()
-                    with bb:
-                        if st.button("✏️ Override — Merge with Group", key=f"override_open_{card_key}"):
-                            override_open.add(card_key)
-                            st.session_state[_OVERRIDE_OPEN_KEY] = override_open
-                            st.rerun()
-                else:
-                    st.markdown("**Override — merge into a consolidation group:**")
-                    group_ids    = sorted({g.group_id for g in intel.groups if g.recommendation == "Consolidate"})
-                    if not group_ids:
-                        group_ids = sorted({g.group_id for g in intel.groups})
-                    max_gid      = max(group_ids) if group_ids else 1
-                    options_labels = [f"Group {gid}" for gid in group_ids] + [f"New Group {max_gid + 1}"]
-                    options_ids    = group_ids + [max_gid + 1]
-                    # Per-file assignment for multi-file separate groups
-                    for fname in group.file_names:
-                        fc1, fc2 = st.columns([3, 2])
-                        with fc1:
-                            st.markdown(f"`{fname}`")
-                        with fc2:
-                            current_gid = group_overrides.get(fname, group.group_id)
-                            safe_idx = options_ids.index(current_gid) if current_gid in options_ids else 0
-                            chosen_label = st.selectbox(
-                                "Group",
-                                options_labels,
-                                index=safe_idx,
-                                key=f"grp_ov_sep_{card_key}_{fname}",
-                                label_visibility="collapsed",
-                            )
-                            group_overrides[fname] = options_ids[options_labels.index(chosen_label)]
-
-                    oa, ob = st.columns([1, 1])
-                    with oa:
-                        if st.button("Apply", key=f"override_apply_{card_key}", type="primary"):
                             st.session_state[_SS_GROUP_OVERRIDES] = group_overrides
                             override_open.discard(card_key)
                             st.session_state[_OVERRIDE_OPEN_KEY] = override_open
