@@ -894,6 +894,61 @@ def _render_step_3() -> None:
                         with st.expander("Why can't this file be combined?", expanded=False):
                             st.markdown(detail)
 
+        # ── KPI Redundancy Analysis ───────────────────────────────────────────
+        kpi_redundancy = getattr(intel, "kpi_redundancy", [])
+        if kpi_redundancy:
+            st.markdown("---")
+            st.markdown("### KPI Redundancy Analysis")
+            st.caption(
+                "Redundancy is determined **only by KPI coverage**. "
+                "A file is redundant when every KPI-referenced column it contains "
+                "is already present in at least one other file. "
+                "Non-KPI columns (dimensions, metadata, unused attributes) are ignored."
+            )
+
+            n_redundant = sum(1 for r in kpi_redundancy if r.redundant)
+            n_partial   = sum(1 for r in kpi_redundancy if r.recommendation.startswith("Partial"))
+            n_retain    = sum(1 for r in kpi_redundancy if r.recommendation == "Retain")
+
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("🗑 Redundant (safe to discard)", n_redundant)
+            rc2.metric("⚠️ Partial — review required",  n_partial)
+            rc3.metric("✅ Retain (unique KPI coverage)", n_retain)
+
+            for r in kpi_redundancy:
+                if r.redundant:
+                    icon, border_color = "🗑", "red"
+                elif r.recommendation.startswith("Partial"):
+                    icon, border_color = "⚠️", "orange"
+                else:
+                    icon, border_color = "✅", "green"
+
+                with st.expander(
+                    f"{icon} **{r.file_name}** — {r.recommendation}  "
+                    f"({r.total_kpi_columns} KPI cols, {r.unique_kpi_columns} unique)",
+                    expanded=r.redundant,
+                ):
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("Total KPI Columns", r.total_kpi_columns)
+                    col_b.metric("Unique KPI Columns", r.unique_kpi_columns,
+                                 delta=None,
+                                 help="KPI columns not present in any other file")
+                    col_c.metric("Covered By", len(r.covered_by))
+
+                    if r.recommendation == "Discard":
+                        st.error(f"**Recommendation: Discard**")
+                    elif r.recommendation.startswith("Partial"):
+                        st.warning(f"**Recommendation: {r.recommendation}**")
+                    else:
+                        st.success(f"**Recommendation: Retain**")
+
+                    st.markdown(r.reason)
+
+                    if r.covered_by:
+                        st.markdown(
+                            "**Covered by:** " + ", ".join(f"`{f}`" for f in r.covered_by)
+                        )
+
         fr = intel.final_recommendation
         if fr.consolidate_files:
             st.success(f"**{fr.summary}**  {fr.business_reasoning}")

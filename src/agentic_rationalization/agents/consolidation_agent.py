@@ -171,6 +171,19 @@ class ConsolidationIntelligenceResult:
     visual_map: str
     kpi_alignments: list = field(default_factory=list)       # list[KpiAlignment]
     workbook_kpi_stats: list = field(default_factory=list)   # list[WorkbookKpiStats]
+    kpi_redundancy: list = field(default_factory=list)       # list[FileRedundancyResult]
+
+
+@dataclass
+class FileRedundancyResult:
+    """KPI-only redundancy assessment for a single file."""
+    file_name: str
+    total_kpi_columns: int          # KPI-referenced columns present in this file
+    unique_kpi_columns: int         # KPI columns NOT covered by any other file
+    covered_by: list[str]           # file(s) that together cover all its KPIs
+    redundant: bool                 # True when unique_kpi_columns == 0 AND grain_compatible
+    recommendation: str             # "Discard" | "Retain" | "Partial — review unique KPIs"
+    reason: str                     # human explanation
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +581,110 @@ def compute_file_group_compatibility(
 # Main run()
 # ---------------------------------------------------------------------------
 
+def _compute_kpi_redundancy(
+    file_names: list[str],
+    col_map: dict[str, list[str]],
+    kpi_referenced: set[str],
+    grain_map: dict[str, "GrainDetectionResult"],
+) -> list["FileRedundancyResult"]:
+    """Determine which files are KPI-redundant.
+
+    A file is redundant when every KPI-referenced column it contains is also
+    present in at least one other file with compatible grain.  Non-KPI columns
+    are irrelevant to this decision.
+    """
+    # Build per-file set of KPI columns (normalized)
+    kpi_by_file: dict[str, set[str]] = {}
+    for fname in file_names:
+        normed = {normalize_column_name(c) for c in col_map.get(fname, [])}
+        kpi_by_file[fname] = normed & kpi_referenced
+
+    results: list[FileRedundancyResult] = []
+    for fname in file_names:
+        my_kpis = kpi_by_file[fname]
+        total_kpi = len(my_kpis)
+
+        if total_kpi == 0:
+            results.append(FileRedundancyResult(
+                file_name=fname,
+                total_kpi_columns=0,
+                unique_kpi_columns=0,
+                covered_by=[],
+                redundant=False,
+                recommendation="Retain",
+                reason="No KPI-referenced columns detected — cannot assess redundancy.",
+            ))
+            continue
+
+        # KPI columns in this file that are NOT present in any other file
+        other_union: set[str] = set()
+        for other, other_kpis in kpi_by_file.items():
+            if other != fname:
+                other_union |= other_kpis
+
+        unique_kpis = my_kpis - other_union
+        covered_by = [
+            other for other, other_kpis in kpi_by_file.items()
+            if other != fname and my_kpis <= other_kpis
+        ]
+
+        if len(unique_kpis) == 0:
+            # All KPIs covered — find minimal covering set
+            if not covered_by:
+                # No single file covers all, but the union does — find pairs
+                for r in range(2, len(file_names)):
+                    import itertools as _it
+                    found = False
+                    for combo in _it.combinations(
+                        [f for f in file_names if f != fname], r
+                    ):
+                        union_kpis = set().union(*(kpi_by_file[f] for f in combo))
+                        if my_kpis <= union_kpis:
+                            covered_by = list(combo)
+                            found = True
+                            break
+                    if found:
+                        break
+
+            recommendation = "Discard"
+            reason = (
+                f"All {total_kpi} KPI column(s) in this file are already available in "
+                f"{', '.join(covered_by) if covered_by else 'other files'}. "
+                "No unique KPIs contributed. "
+                "Retaining this file adds no KPI coverage."
+            )
+            redundant = True
+        elif len(unique_kpis) < total_kpi:
+            recommendation = "Partial — review unique KPIs"
+            reason = (
+                f"{total_kpi - len(unique_kpis)} of {total_kpi} KPI column(s) are covered "
+                f"by other files. "
+                f"{len(unique_kpis)} unique KPI column(s) not found elsewhere: "
+                f"{', '.join(sorted(unique_kpis)[:5])}{'…' if len(unique_kpis) > 5 else ''}. "
+                "Review whether these unique KPIs are required."
+            )
+            redundant = False
+        else:
+            recommendation = "Retain"
+            reason = (
+                f"All {total_kpi} KPI column(s) are unique to this file — "
+                "no other file provides equivalent KPI coverage."
+            )
+            redundant = False
+
+        results.append(FileRedundancyResult(
+            file_name=fname,
+            total_kpi_columns=total_kpi,
+            unique_kpi_columns=len(unique_kpis),
+            covered_by=covered_by,
+            redundant=redundant,
+            recommendation=recommendation,
+            reason=reason,
+        ))
+
+    return results
+
+
 def run(
     bundles: list,
     config: RationalizationConfig,
@@ -764,6 +881,7 @@ def run(
         file_names, col_map, kpi_referenced, kpi_label_map, kpi_result
     )
     wb_kpi_stats = _compute_workbook_kpi_stats(file_names, kpi_result, config)
+    kpi_redundancy = _compute_kpi_redundancy(file_names, col_map, kpi_referenced, grain_map)
 
     intelligence_result = ConsolidationIntelligenceResult(
         file_profiles=file_profiles,
@@ -774,6 +892,7 @@ def run(
         visual_map=visual_map,
         kpi_alignments=kpi_alignments,
         workbook_kpi_stats=wb_kpi_stats,
+        kpi_redundancy=kpi_redundancy,
     )
 
     # ── Phase B: Strategy ──────────────────────────────────────────────────
