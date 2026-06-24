@@ -129,7 +129,7 @@ def _render_agent_card(result: AgentResult) -> None:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-# ── Progress indicator ────────────────────────────────────────────────────────
+# ── Sidebar step navigation ───────────────────────────────────────────────────
 
 _STEP_LABELS = [
     "1. Upload",
@@ -143,17 +143,49 @@ _STEP_LABELS = [
 ]
 
 
-def _render_progress_bar() -> None:
+def _render_sidebar_nav() -> None:
+    """Render the persistent left-side workflow navigation panel."""
     step = _current_step()
-    cols = st.columns(len(_STEP_LABELS))
-    for i, (col, label) in enumerate(zip(cols, _STEP_LABELS), start=1):
-        if i < step:
-            col.markdown(f"<div style='text-align:center;color:#22c55e;font-size:0.8em'>✅ {label}</div>", unsafe_allow_html=True)
-        elif i == step:
-            col.markdown(f"<div style='text-align:center;color:#3b82f6;font-weight:bold;font-size:0.8em'>▶ {label}</div>", unsafe_allow_html=True)
-        else:
-            col.markdown(f"<div style='text-align:center;color:#9ca3af;font-size:0.8em'>{label}</div>", unsafe_allow_html=True)
-    st.markdown("---")
+    with st.sidebar:
+        st.divider()
+        st.markdown("**Agentic Rationalization**")
+        for i, label in enumerate(_STEP_LABELS, start=1):
+            if i < step:
+                # Completed — clickable to navigate back
+                if st.button(
+                    f"✅  {label}",
+                    key=f"ar_nav_{i}",
+                    use_container_width=True,
+                    help="Navigate back to this step",
+                ):
+                    _set_step(i)
+                    st.rerun()
+            elif i == step:
+                # Current step — highlighted
+                st.markdown(
+                    f"<div style='"
+                    f"background:#1e40af;color:white;"
+                    f"padding:0.35rem 0.75rem;"
+                    f"border-radius:0.375rem;"
+                    f"font-size:0.85rem;font-weight:600;"
+                    f"margin:0.15rem 0;"
+                    f"'>▶  {label}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Future step — disabled
+                st.button(
+                    f"◦  {label}",
+                    key=f"ar_nav_{i}",
+                    use_container_width=True,
+                    disabled=True,
+                )
+
+
+# ── Progress indicator (removed — replaced by sidebar nav) ───────────────────
+
+def _render_progress_bar() -> None:
+    pass  # kept for any external callers; sidebar nav is used instead
 
 
 # ── Override panel helpers (kept from original) ───────────────────────────────
@@ -314,6 +346,8 @@ def _render_consolidation_card(ad: ActionableDecision, idx: int) -> None:
 # ── Per-step renderers ────────────────────────────────────────────────────────
 
 def _render_step_1() -> None:
+    if _current_step() != 1:
+        return
     st.subheader("Step 1 — Upload Workbooks")
     uploaded = st.file_uploader(
         "Upload one or more Excel workbooks (.xlsx)",
@@ -377,7 +411,7 @@ def _infer_tab_tag(sheet_name: str, source_tab: str, kpi_tabs: list[str]) -> str
 
 def _render_step_2() -> None:
     step = _current_step()
-    if step < 2:
+    if step != 2:
         return
 
     st.subheader("Step 2 — Discovery")
@@ -816,7 +850,7 @@ def _render_step_3() -> None:
     from src.agentic_rationalization.agents.consolidation_agent import compute_file_group_compatibility
 
     step = _current_step()
-    if step < 3:
+    if step != 3:
         return
 
     st.subheader("Step 3 — Consolidation Workspace")
@@ -1476,7 +1510,7 @@ def _render_step_3() -> None:
 
 def _render_step_4() -> None:
     step = _current_step()
-    if step < 4:
+    if step != 4:
         return
 
     st.subheader("Step 4 — Select Group to Process")
@@ -1549,7 +1583,7 @@ def _render_step_4() -> None:
 
 def _render_step_5() -> None:
     step = _current_step()
-    if step < 5:
+    if step != 5:
         return
 
     st.subheader("Step 5 — Schema Rationalization")
@@ -1770,7 +1804,7 @@ def _render_step_5() -> None:
 
 def _render_step_6() -> None:
     step = _current_step()
-    if step < 6:
+    if step != 6:
         return
 
     st.subheader("Step 6 — KPI Analysis")
@@ -1885,7 +1919,7 @@ def _render_step_6() -> None:
 
 def _render_step_7() -> None:
     step = _current_step()
-    if step < 7:
+    if step != 7:
         return
 
     st.subheader("Step 7 — Validation")
@@ -2007,7 +2041,7 @@ def _render_step_7() -> None:
 
 def _render_step_8() -> None:
     step = _current_step()
-    if step < 8:
+    if step != 8:
         return
 
     st.subheader("Step 8 — Generate & Download")
@@ -2213,14 +2247,7 @@ def _render_validation_error(step_name: str, missing: "list[str]") -> None:
 # ── Main page ─────────────────────────────────────────────────────────────────
 
 def render() -> None:
-    st.title("Agentic Rationalization")
-    st.caption(
-        "A step-by-step consulting workflow — AI agents analyse your workbooks, "
-        "explain every decision with confidence scores, "
-        "and let you confirm before each phase proceeds."
-    )
-
-    _render_progress_bar()
+    _render_sidebar_nav()
 
     _render_step_1()
     _render_step_2()
