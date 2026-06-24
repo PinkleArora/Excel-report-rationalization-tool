@@ -158,7 +158,7 @@ def run(
                 "referenced_sheets":     tab.referenced_sheets,
                 "is_pivot_sheet":        tab.is_pivot_sheet,
                 "pivot_source_tabs":     tab.pivot_source_tabs,
-                "pivot_value_fields":    tab.pivot_value_fields,
+                "pivot_value_fields":    [m.display_name for m in tab.pivot_value_fields],
                 "detection_type":        detection_type,
             }
             # Use pivot-aware reasoning when applicable; fall back to signal-based

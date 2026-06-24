@@ -592,7 +592,7 @@ def _render_step_2() -> None:
                         None,
                     )
                     if tab_analysis is not None and tab_analysis.is_pivot_sheet and tab_analysis.pivot_value_fields:
-                        from src.ingestion.workbook_analyzer import KpiBlock
+                        from src.ingestion.workbook_analyzer import KpiBlock, KpiMeasure  # noqa: F401
                         all_dim_fields = (
                             tab_analysis.pivot_filter_fields
                             + tab_analysis.pivot_row_fields
@@ -648,7 +648,9 @@ def _render_step_2() -> None:
                                 st.markdown(f"- {dim}")
                         st.markdown("**KPI Measures**")
                         for measure in blk.kpi_measures:
-                            st.markdown(f"- {measure}")
+                            agg = getattr(measure, "aggregation", "")
+                            agg_tag = f" `{agg}`" if agg else ""
+                            st.markdown(f"- {measure.display_name}{agg_tag}")
             else:
                 # ── Flat column list (source tab or KPI tab with no blocks) ──
                 col_rows_data = []

@@ -138,6 +138,32 @@ class SignalVector:
 
 
 @dataclass
+class KpiMeasure:
+    """A single KPI measure with its normalized display name and aggregation method.
+
+    Pivot table data fields and formula-based KPI columns often carry an
+    aggregation prefix in their name (e.g. "Sum of GA Stat Reserve").
+    This dataclass separates the human-readable metric name from the
+    aggregation function so downstream matching and display can use the
+    clean name.
+    """
+
+    display_name: str    # normalized name, aggregation prefix removed
+    aggregation: str     # "SUM" | "AVG" | "COUNT" | "MIN" | "MAX" | "" etc.
+
+    def __str__(self) -> str:
+        return self.display_name
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, KpiMeasure):
+            return self.display_name == other.display_name and self.aggregation == other.aggregation
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.display_name, self.aggregation))
+
+
+@dataclass
 class KpiBlock:
     """A self-contained KPI section within a summary/KPI tab.
 
@@ -147,12 +173,12 @@ class KpiBlock:
     blocks for "STAT Reserve", "Tax Reserves", "GAAP Ben Reserves", etc.
     """
 
-    block_name: str           # section title, e.g. "STAT Reserve"
-    dimensions: list[str]     # row-label columns (text), e.g. ["Product Subtype"]
-    kpi_measures: list[str]   # KPI/measure column names from the header row
-    header_row: int           # 1-based worksheet row index of the block header
-    data_start_row: int       # 1-based row index of the first data row
-    data_end_row: int         # 1-based row index of the last data row
+    block_name: str                # section title, e.g. "STAT Reserve"
+    dimensions: list[str]          # row-label columns (text), e.g. ["Product Subtype"]
+    kpi_measures: list[KpiMeasure] # KPI/measure columns with normalized names
+    header_row: int                # 1-based worksheet row index of the block header
+    data_start_row: int            # 1-based row index of the first data row
+    data_end_row: int              # 1-based row index of the last data row
 
 
 @dataclass
@@ -174,7 +200,7 @@ class TabAnalysis:
     # Pivot metadata — populated when sheet contains or feeds a pivot table
     is_pivot_sheet: bool = False             # True when this sheet has pivot tables
     pivot_source_tabs: list[str] = field(default_factory=list)   # sheets feeding this pivot
-    pivot_value_fields: list[str] = field(default_factory=list)  # measure/KPI field names
+    pivot_value_fields: list[KpiMeasure] = field(default_factory=list)  # measure/KPI fields (normalized)
     pivot_row_fields: list[str] = field(default_factory=list)    # row dimension fields
     pivot_col_fields: list[str] = field(default_factory=list)    # column dimension fields
     pivot_filter_fields: list[str] = field(default_factory=list) # page/filter dimension fields
@@ -245,12 +271,14 @@ class WorkbookAnalysis:
         return [t.tab_name for t in self.tab_analyses if t.is_pivot_sheet]
 
     @property
-    def all_pivot_value_fields(self) -> list[str]:
-        """All pivot value (measure) fields across all KPI tabs."""
-        fields: list[str] = []
+    def all_pivot_value_fields(self) -> list[KpiMeasure]:
+        """All pivot value (measure) fields across all KPI tabs (normalized)."""
+        fields: list[KpiMeasure] = []
+        seen: set[str] = set()
         for t in self.tab_analyses:
             for f in t.pivot_value_fields:
-                if f not in fields:
+                if f.display_name not in seen:
+                    seen.add(f.display_name)
                     fields.append(f)
         return fields
 
@@ -534,7 +562,7 @@ def analyze_workbook(
             tab.tab_type = TabType.KPI_SUMMARY
             tab.is_pivot_sheet = True
             tab.pivot_source_tabs = pinfo.source_sheets
-            tab.pivot_value_fields = pinfo.value_fields
+            tab.pivot_value_fields = [strip_aggregate_prefix(f) for f in pinfo.value_fields]
             tab.pivot_row_fields = pinfo.row_fields
             tab.pivot_col_fields = pinfo.col_fields
             tab.pivot_filter_fields = pinfo.filter_fields
@@ -1099,35 +1127,79 @@ def _detect_aggregate_function(formula: str) -> str:
 
 _KPI_BLOCK_MAX_BLANK_GAP = 3  # consecutive blank rows that terminate a block
 
-# Column-name prefixes that unambiguously identify an aggregated KPI measure.
-# Matches case-insensitively.
-_AGGREGATE_NAME_PREFIXES = (
-    "sum of ", "count of ", "avg of ", "average of ",
-    "min of ", "max of ", "total of ", "% of ", "pct of ",
-    "stdev of ", "var of ", "median of ",
+# Maps lowercase aggregate prefix → canonical aggregation code.
+# Sorted longest-first at module level to avoid partial matches during lookup.
+_AGG_PREFIX_MAP: dict[str, str] = {
+    "distinct count of ": "DISTINCTCOUNT",
+    "average of ":        "AVG",
+    "median of ":         "MEDIAN",
+    "stdev of ":          "STDEV",
+    "total of ":          "SUM",
+    "count of ":          "COUNT",
+    "sum of ":            "SUM",
+    "avg of ":            "AVG",
+    "min of ":            "MIN",
+    "max of ":            "MAX",
+    "var of ":            "VAR",
+    "% of ":              "PCT",
+    "pct of ":            "PCT",
+}
+# Pre-sorted tuple (longest prefix first) for fast sequential matching
+_AGG_PREFIXES_SORTED: tuple[str, ...] = tuple(
+    sorted(_AGG_PREFIX_MAP, key=len, reverse=True)
 )
+
+
+def strip_aggregate_prefix(name: str) -> "KpiMeasure":
+    """Normalize a KPI column name by stripping its aggregation prefix.
+
+    Returns a :class:`KpiMeasure` with ``display_name`` set to the metric name
+    and ``aggregation`` set to the canonical aggregation code (e.g. ``"SUM"``).
+    If no known prefix is found, ``aggregation`` is ``""`` and ``display_name``
+    is the original name unchanged.
+
+    Examples::
+
+        strip_aggregate_prefix("Sum of GA Stat Reserve")
+        # → KpiMeasure(display_name="GA Stat Reserve", aggregation="SUM")
+
+        strip_aggregate_prefix("Average of Policy Count")
+        # → KpiMeasure(display_name="Policy Count", aggregation="AVG")
+
+        strip_aggregate_prefix("Gross Reserve")
+        # → KpiMeasure(display_name="Gross Reserve", aggregation="")
+    """
+    low = name.lower()
+    for prefix in _AGG_PREFIXES_SORTED:
+        if low.startswith(prefix):
+            display_name = name[len(prefix):].strip() or name
+            return KpiMeasure(display_name=display_name, aggregation=_AGG_PREFIX_MAP[prefix])
+    return KpiMeasure(display_name=name, aggregation="")
 
 
 def _col_is_aggregate_by_name(col_name: str) -> bool:
     """Return True when the column name starts with a known aggregate prefix."""
     low = col_name.lower()
-    return any(low.startswith(p) for p in _AGGREGATE_NAME_PREFIXES)
+    return any(low.startswith(p) for p in _AGG_PREFIXES_SORTED)
 
 
 def _classify_block_columns(
     col_names: list[str | None],
     sample_txt: list[int],
     sample_num: list[int],
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[KpiMeasure]]:
     """Classify columns as dimensions or KPI measures.
 
     Rules (applied in order):
-    1. Column name starts with an aggregate prefix → KPI measure.
+    1. Column name starts with an aggregate prefix → KPI measure (normalized).
     2. All text, no numeric samples → dimension (row label).
-    3. Positional: find the index of the first KPI measure (from rules 1 or 3b).
+    3. Positional: find the index of the first KPI measure (from rule 1 or 3b).
        Columns before that index are dimensions even if numeric (grouping codes).
        Columns at or after are KPI measures unless they are pure-text.
-    4. Any numeric column after the first KPI measure → KPI measure.
+    4. Any numeric column at/after the first measure boundary → KPI measure.
+
+    KPI measures are returned as :class:`KpiMeasure` objects so the aggregation
+    prefix (e.g. "Sum of") is stored separately from the display name.
     """
     n = len(col_names)
     # Step 1 & 2: initial per-column classification
@@ -1141,8 +1213,7 @@ def _classify_block_columns(
         elif sample_txt[ci] > 0 and sample_num[ci] == 0:
             is_text_only[ci] = True
 
-    # Step 3: find the first aggregate-named or first clearly-numeric non-text column
-    # to anchor the dimension/measure boundary.
+    # Step 3: anchor the dimension/measure boundary at the first aggregate column
     first_measure_idx: int | None = None
     for ci, col_name in enumerate(col_names):
         if col_name is None:
@@ -1151,8 +1222,7 @@ def _classify_block_columns(
             first_measure_idx = ci
             break
 
-    # If no aggregate-name found, fall back to the first purely-numeric column
-    # that isn't text-only (legacy heuristic for unlabelled pivots).
+    # Fallback: first purely-numeric non-text column (unlabelled pivots)
     if first_measure_idx is None:
         for ci, col_name in enumerate(col_names):
             if col_name is None:
@@ -1162,7 +1232,7 @@ def _classify_block_columns(
                 break
 
     dimensions: list[str] = []
-    kpi_measures: list[str] = []
+    kpi_measures: list[KpiMeasure] = []
     for ci, col_name in enumerate(col_names):
         if col_name is None:
             continue
@@ -1170,14 +1240,14 @@ def _classify_block_columns(
             # Pure text → always a dimension
             dimensions.append(col_name)
         elif is_agg[ci]:
-            kpi_measures.append(col_name)
+            kpi_measures.append(strip_aggregate_prefix(col_name))
         elif first_measure_idx is not None and ci < first_measure_idx:
             # Appears before the first known aggregate → grouping dimension
-            # (handles numeric codes like Ledger Product, Plancode, etc.)
+            # (handles numeric codes like Ledger Product, Plancode, Policy Number)
             dimensions.append(col_name)
         else:
             # Numeric column at or after the first measure boundary → KPI
-            kpi_measures.append(col_name)
+            kpi_measures.append(strip_aggregate_prefix(col_name))
 
     return dimensions, kpi_measures
 

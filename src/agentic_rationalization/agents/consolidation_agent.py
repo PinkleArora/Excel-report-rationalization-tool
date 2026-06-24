@@ -513,7 +513,8 @@ def _compute_workbook_kpi_stats(
         if kpi_col_count == 0 and blocks:
             block_measures: set[str] = set()
             for blk in blocks:
-                block_measures.update(getattr(blk, "kpi_measures", []))
+                for m in getattr(blk, "kpi_measures", []):
+                    block_measures.add(getattr(m, "display_name", str(m)))
             kpi_col_count = len(block_measures)
 
         if kpi_col_count > 0:
@@ -634,7 +635,7 @@ def _compute_kpi_redundancy(
             measures: set[str] = set()
             for blk in blocks:
                 for m in getattr(blk, "kpi_measures", []):
-                    measures.add(normalize_column_name(str(m)))
+                    measures.add(normalize_column_name(getattr(m, "display_name", str(m))))
             kpi_by_file[fname] = measures
         _using_blocks = True
     else:
