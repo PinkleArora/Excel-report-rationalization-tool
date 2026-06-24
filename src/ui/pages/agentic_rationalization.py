@@ -339,6 +339,41 @@ def _render_step_1() -> None:
         st.rerun()
 
 
+def _tab_structure_label(bundle, sheet_name: str, discovery_result: "AgentResult | None") -> str:
+    """Return 'Raw Data', 'Pivot Table', or 'Formula Based' for a tab."""
+    # Check pivot signal from discovery decisions
+    if discovery_result:
+        for d in discovery_result.decisions:
+            if d.subject.endswith(f" / {sheet_name}") and d.signals:
+                if d.signals.get("is_pivot_sheet"):
+                    return "Pivot Table"
+                fd = d.signals.get("formula_density_pct", 0)
+                if fd >= 20:
+                    return "Formula Based"
+    # Fallback: scan the DataFrame
+    df = bundle.sheets.get(sheet_name)
+    if df is None:
+        return "—"
+    raw_wb = getattr(bundle, "_raw_wb", None)
+    if raw_wb is not None:
+        try:
+            raw_ws = raw_wb[sheet_name]
+            if getattr(raw_ws, "_pivots", []):
+                return "Pivot Table"
+        except Exception:
+            pass
+    return "Raw Data"
+
+
+def _infer_tab_tag(sheet_name: str, source_tab: str, kpi_tabs: list[str]) -> str:
+    """Return 'Source', 'KPI', or 'Ignore' for a tab based on discovery output."""
+    if sheet_name == source_tab:
+        return "Source"
+    if sheet_name in kpi_tabs:
+        return "KPI"
+    return "Ignore"
+
+
 def _render_step_2() -> None:
     step = _current_step()
     if step < 2:
@@ -351,20 +386,19 @@ def _render_step_2() -> None:
         st.warning("No bundles loaded. Return to Step 1.")
         return
 
-    # Run discovery if not already done
+    # ── Run discovery if not already done ────────────────────────────────────
     discovery_result: AgentResult | None = st.session_state.get(_SS_DISCOVERY)
     if discovery_result is None:
-        overrides = st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {})
+        src_overrides = st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {})
         kpi_overrides = st.session_state.get("ar_kpi_tab_overrides", {})
-        # Convert flat overrides {file_name: tab_name} to discovery_agent format
         discovery_overrides: dict[str, dict] = {
-            fname: {"source_tab": tab} for fname, tab in overrides.items()
+            fname: {"source_tab": tab} for fname, tab in src_overrides.items()
         }
         for fname, kpi_tabs_list in kpi_overrides.items():
             if fname not in discovery_overrides:
                 discovery_overrides[fname] = {}
             discovery_overrides[fname]["kpi_tabs"] = kpi_tabs_list
-        with st.spinner("Running Discovery Agent…"):
+        with st.spinner("Running Discovery…"):
             try:
                 discovery_result = run_discovery_phase(bundles, overrides=discovery_overrides)
             except Exception as exc:
@@ -372,193 +406,183 @@ def _render_step_2() -> None:
                 st.code(traceback.format_exc(), language="python")
                 return
         st.session_state[_SS_DISCOVERY] = discovery_result
-        config = discovery_result.output
-        st.session_state[_SS_CONFIG] = config
+        st.session_state[_SS_CONFIG] = discovery_result.output
 
     config = discovery_result.output
     if config is None:
-        st.error("Discovery Agent did not produce a configuration.")
-        for w in discovery_result.warnings:
-            st.warning(w)
+        st.error("Discovery did not produce a configuration.")
         return
 
-    st.warning(
-        "Source tab selection affects all downstream analysis. "
-        "Confirm before proceeding."
+    # ── Workbook selector ─────────────────────────────────────────────────────
+    wb_names = [b.file_name for b in bundles]
+    selected_wb = st.selectbox(
+        "Workbook",
+        wb_names,
+        key="ar_disc_selected_wb",
+        label_visibility="visible",
     )
+    bundle = next(b for b in bundles if b.file_name == selected_wb)
+    wb_cfg = config.config_for(selected_wb)
+    source_tab = (st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {}).get(selected_wb)
+                  or (wb_cfg.source_tab if wb_cfg else ""))
+    kpi_tabs   = (st.session_state.get("ar_kpi_tab_overrides", {}).get(selected_wb)
+                  or (wb_cfg.kpi_tabs if wb_cfg else []))
+    all_sheets = list(bundle.sheets.keys())
 
-    # Per-workbook display
-    changed = False
-    src_overrides: dict[str, str] = st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {})
+    # ── Pending tag edits — stored per workbook ───────────────────────────────
+    # ar_disc_tags: {wb_name: {sheet_name: "Source"|"KPI"|"Ignore"}}
+    _SS_DISC_TAGS = "ar_disc_tags"
+    all_tags: dict[str, dict[str, str]] = st.session_state.get(_SS_DISC_TAGS, {})
+    # Initialise tags for this workbook if not set
+    if selected_wb not in all_tags:
+        all_tags[selected_wb] = {
+            s: _infer_tab_tag(s, source_tab, kpi_tabs) for s in all_sheets
+        }
+        st.session_state[_SS_DISC_TAGS] = all_tags
+    current_tags: dict[str, str] = all_tags[selected_wb]
 
-    for bundle in bundles:
-        fname = bundle.file_name
-        wb_cfg = config.config_for(fname)
-        source_tab = src_overrides.get(fname) or (wb_cfg.source_tab if wb_cfg else "")
-        kpi_tabs   = wb_cfg.kpi_tabs if wb_cfg else []
-        all_sheets = list(bundle.sheets.keys())
+    # Committed tags (what discovery was actually run with)
+    committed_tags: dict[str, str] = {
+        s: _infer_tab_tag(s, source_tab, kpi_tabs) for s in all_sheets
+    }
+    has_pending = current_tags != committed_tags
 
-        # Find confidence for the source tab from decisions
-        tab_conf = 0.0
-        for d in discovery_result.decisions:
-            if d.subject == f"{fname} / {source_tab}":
-                tab_conf = d.confidence
-                break
+    # ── Tabs table ────────────────────────────────────────────────────────────
+    st.markdown("**Tabs**")
+    _TAG_OPTIONS = ["Source", "KPI", "Ignore"]
+    col_tab, col_tag, col_struct, col_rows, col_cols = st.columns([3, 2, 2, 1, 1])
+    col_tab.markdown("**Tab Name**")
+    col_tag.markdown("**Tag**")
+    col_struct.markdown("**Structure**")
+    col_rows.markdown("**Rows**")
+    col_cols.markdown("**Cols**")
 
-        # Grain info if available
-        consol_result: AgentResult | None = st.session_state.get(_SS_CONSOLIDATION)
-        grain_label = "—"
-        row_count = col_count = 0
-        if consol_result and consol_result.output:
-            intel = consol_result.output.get("intelligence")
-            if intel:
-                fp = next((p for p in intel.file_profiles if p.file_name == fname), None)
-                if fp:
-                    grain_label = fp.inferred_grain
-                    row_count   = fp.row_count
-                    col_count   = fp.column_count
+    for sheet_name in all_sheets:
+        df_sheet = bundle.sheets.get(sheet_name)
+        n_rows = len(df_sheet) if df_sheet is not None else 0
+        n_cols = len(df_sheet.columns) if df_sheet is not None else 0
+        struct = _tab_structure_label(bundle, sheet_name, discovery_result)
 
-        # Source tab and KPI tab confidence
-        src_conf_icon = _conf_color(tab_conf)
-        src_conf_pct  = f"{tab_conf:.0%}" if tab_conf > 0 else "—"
-        low_conf_src  = tab_conf > 0 and tab_conf < 0.85
+        c_tab, c_tag, c_struct, c_rows, c_cols = st.columns([3, 2, 2, 1, 1])
+        with c_tab:
+            # Clicking the tab name sets it as the column-explorer target
+            if st.button(sheet_name, key=f"ar_disc_sel_{selected_wb}_{sheet_name}", use_container_width=True):
+                st.session_state["ar_disc_explorer_tab"] = (selected_wb, sheet_name)
+        with c_tag:
+            current_tag = current_tags.get(sheet_name, "Ignore")
+            new_tag = st.selectbox(
+                "tag",
+                _TAG_OPTIONS,
+                index=_TAG_OPTIONS.index(current_tag),
+                key=f"ar_disc_tag_{selected_wb}_{sheet_name}",
+                label_visibility="collapsed",
+            )
+            if new_tag != current_tag:
+                current_tags[sheet_name] = new_tag
+                all_tags[selected_wb] = current_tags
+                st.session_state[_SS_DISC_TAGS] = all_tags
+                has_pending = True
+                st.rerun()
+        c_struct.markdown(struct)
+        c_rows.markdown(str(n_rows))
+        c_cols.markdown(str(n_cols))
 
-        kpi_tab_confs: dict[str, float] = {}
-        for d in discovery_result.decisions:
-            for kt in kpi_tabs:
-                if d.subject == f"{fname} / {kt}":
-                    kpi_tab_confs[kt] = d.confidence
-        kpi_conf_avg = sum(kpi_tab_confs.values()) / len(kpi_tab_confs) if kpi_tab_confs else 0.0
-        kpi_conf_icon = _conf_color(kpi_conf_avg) if kpi_conf_avg > 0 else "⚪"
-        low_conf_kpi  = kpi_conf_avg > 0 and kpi_conf_avg < 0.85
+    # ── Column Explorer ───────────────────────────────────────────────────────
+    explorer_target = st.session_state.get("ar_disc_explorer_tab")
+    # Default to source tab on first render
+    if explorer_target is None or explorer_target[0] != selected_wb:
+        if source_tab in all_sheets:
+            explorer_target = (selected_wb, source_tab)
+            st.session_state["ar_disc_explorer_tab"] = explorer_target
 
-        # Detection type inferred from decisions (read-only — not user-configurable)
-        _DT_ICONS = {"Formula-Based": "🧮", "Pivot-Based": "🔄", "Mixed": "⚡"}
-        src_decision = next(
-            (d for d in discovery_result.decisions if d.subject == f"{fname} / {source_tab}"),
-            None,
-        )
-        detection_type = (
-            src_decision.signals.get("detection_type", "Formula-Based")
-            if src_decision and src_decision.signals else "Formula-Based"
-        )
-        # Also check KPI tab decisions for pivot signals
-        for kt in kpi_tabs:
-            kd = next((d for d in discovery_result.decisions if d.subject == f"{fname} / {kt}"), None)
-            if kd and kd.signals:
-                if kd.signals.get("is_pivot_sheet"):
-                    detection_type = "Pivot-Based" if detection_type == "Formula-Based" else "Mixed"
-                    break
-        dt_icon = _DT_ICONS.get(detection_type, "🧮")
+    if explorer_target and explorer_target[0] == selected_wb:
+        explorer_sheet = explorer_target[1]
+        df_exp = bundle.sheets.get(explorer_sheet)
+        if df_exp is not None:
+            st.markdown("---")
+            st.markdown(f"**Selected Tab: `{explorer_sheet}`**")
+            struct_label = _tab_structure_label(bundle, explorer_sheet, discovery_result)
+            ec1, ec2, ec3 = st.columns(3)
+            ec1.metric("Rows", f"{len(df_exp):,}")
+            ec2.metric("Columns", len(df_exp.columns))
+            ec3.metric("Structure", struct_label)
 
-        # KPI count from discovery signals
-        kpi_count = sum(
-            len(d.signals.get("pivot_value_fields", []))
-            for d in discovery_result.decisions
-            if d.subject.startswith(f"{fname} / ") and d.signals.get("is_pivot_sheet")
-        )
+            # Column table
+            col_rows_data = []
+            for col in df_exp.columns:
+                dtype = df_exp[col].dtype
+                if str(dtype).startswith("int") or str(dtype).startswith("float"):
+                    dtype_label = "Numeric"
+                elif str(dtype) in ("object", "string"):
+                    # Try to detect date-like columns by name
+                    col_lower = str(col).lower()
+                    if any(kw in col_lower for kw in ("date", "period", "month", "year", "day")):
+                        dtype_label = "Date"
+                    else:
+                        dtype_label = "Text"
+                elif "datetime" in str(dtype):
+                    dtype_label = "Date"
+                elif "bool" in str(dtype):
+                    dtype_label = "Boolean"
+                else:
+                    dtype_label = str(dtype)
+                col_rows_data.append({"Column Name": str(col), "Data Type": dtype_label})
+            st.dataframe(
+                pd.DataFrame(col_rows_data),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        # Reasoning text for WHY panel
-        src_reasoning = src_decision.reasoning if src_decision else "—"
-        kpi_reasonings: list[str] = []
-        for kt in kpi_tabs:
-            kd = next((d for d in discovery_result.decisions if d.subject == f"{fname} / {kt}"), None)
-            if kd:
-                kpi_reasonings.append(f"**`{kt}`**: {kd.reasoning}")
+    # ── Action buttons ────────────────────────────────────────────────────────
+    st.markdown("---")
+    btn_c1, btn_c2 = st.columns([1, 1])
 
-        with st.container(border=True):
-            st.markdown(f"**📁 {fname}**")
-
-            # ── Discovery Validation Panel ─────────────────────────────────
-            vm1, vm2, vm3, vm4, vm5, vm6 = st.columns(6)
-            vm1.metric("Source Tab", source_tab)
-            vm2.metric("KPI Tab(s)", len(kpi_tabs))
-            vm3.metric(f"{dt_icon} Detection", detection_type)
-            vm4.metric("Grain", grain_label if grain_label != "—" else "Pending")
-            vm5.metric("KPI Count", kpi_count if kpi_count else "Pending")
-            vm6.metric("Confidence", src_conf_pct)
-
-            if low_conf_src or low_conf_kpi or not kpi_tabs:
-                if low_conf_src:
-                    st.warning(f"⚠️ Source tab confidence is {src_conf_pct} — consider overriding")
-                if not kpi_tabs:
-                    st.warning("⚠️ No KPI tabs detected — check if workbook uses pivot tables")
-                elif low_conf_kpi:
-                    st.warning(f"⚠️ KPI tab confidence is {kpi_conf_avg:.0%} — consider overriding")
-
-            # WHY panel
-            with st.expander("Why was this classified this way?", expanded=False):
-                st.markdown(f"**Source Tab = `{source_tab}`**")
-                st.caption(src_reasoning)
-                if kpi_reasonings:
-                    st.markdown("**KPI Tab(s):**")
-                    for r in kpi_reasonings:
-                        st.caption(r)
-                if not kpi_reasonings and kpi_tabs:
-                    st.caption("KPI tab reasoning not available.")
-
-            # ── Override: Source Tab + KPI Tab only ───────────────────────
-            if all_sheets:
-                with st.expander(
-                    f"Override for `{fname}`",
-                    expanded=low_conf_src or low_conf_kpi or not kpi_tabs,
-                ):
-                    st.caption("Detection Type is inferred automatically and cannot be overridden.")
-                    ov_c1, ov_c2 = st.columns(2)
-                    with ov_c1:
-                        default_idx = all_sheets.index(source_tab) if source_tab in all_sheets else 0
-                        new_tab = st.selectbox(
-                            "Source tab:",
-                            all_sheets,
-                            index=default_idx,
-                            key=f"ar_src_tab_{fname}",
-                        )
-                        if new_tab != source_tab:
-                            src_overrides[fname] = new_tab
-                            changed = True
-                    with ov_c2:
-                        kpi_defaults = [s for s in kpi_tabs if s in all_sheets]
-                        new_kpi_tabs = st.multiselect(
-                            "KPI tab(s):",
-                            all_sheets,
-                            default=kpi_defaults,
-                            key=f"ar_kpi_tabs_{fname}",
-                        )
-                        current_kpi_key = f"_kpi_tabs_{fname}"
-                        old_kpi = st.session_state.get(current_kpi_key, kpi_defaults)
-                        if sorted(new_kpi_tabs) != sorted(old_kpi):
-                            st.session_state[current_kpi_key] = new_kpi_tabs
-                            kpi_overrides = st.session_state.get("ar_kpi_tab_overrides", {})
-                            kpi_overrides[fname] = new_kpi_tabs
-                            st.session_state["ar_kpi_tab_overrides"] = kpi_overrides
-                            changed = True
-
-    if changed:
-        st.session_state[_SS_SOURCE_TAB_OVERRIDES] = src_overrides
-        # Include KPI tab overrides in discovery overrides on next re-run
-        st.session_state.pop(_SS_DISCOVERY, None)
-        st.session_state.pop(_SS_CONSOLIDATION, None)
-        st.session_state.pop(_SS_SCHEMA, None)
-        st.rerun()
-
-    with st.expander("Agent Details", expanded=False):
-        _render_agent_card(discovery_result)
-
-    if step == 2:
-        if st.button("✅ Confirm Source Tabs & Continue", type="primary", key="ar_btn_confirm_discovery"):
-            with st.spinner("Analysing KPI formulas and grouping files… (this may take a moment for large workbooks)"):
-                try:
-                    kpi_result_obj = run_kpi_phase(bundles, config)
-                    st.session_state[_SS_KPI] = kpi_result_obj
-                    kpi_analysis = kpi_result_obj.output if kpi_result_obj else None
-                    consol = run_consolidation_phase(bundles, config, kpi_result=kpi_analysis)
-                    st.session_state[_SS_CONSOLIDATION] = consol
-                except Exception as exc:
-                    st.error(f"Analysis failed: `{type(exc).__name__}: {exc}`")
-                    st.code(traceback.format_exc(), language="python")
-                    return
-            _set_step(3)
+    with btn_c1:
+        if st.button(
+            "🔄 Update Discovery",
+            disabled=not has_pending,
+            key="ar_btn_update_discovery",
+        ):
+            # Apply pending tags as overrides and re-run discovery
+            new_src_overrides: dict[str, str] = {}
+            new_kpi_overrides: dict[str, list[str]] = {}
+            for wb_n, tag_map in all_tags.items():
+                src = next((s for s, t in tag_map.items() if t == "Source"), "")
+                kpis = [s for s, t in tag_map.items() if t == "KPI"]
+                if src:
+                    new_src_overrides[wb_n] = src
+                if kpis:
+                    new_kpi_overrides[wb_n] = kpis
+            st.session_state[_SS_SOURCE_TAB_OVERRIDES] = new_src_overrides
+            st.session_state["ar_kpi_tab_overrides"] = new_kpi_overrides
+            # Clear discovery + downstream so they re-run with new overrides
+            st.session_state.pop(_SS_DISCOVERY, None)
+            st.session_state.pop(_SS_CONSOLIDATION, None)
+            st.session_state.pop(_SS_SCHEMA, None)
+            st.session_state.pop(_SS_DISC_TAGS, None)
             st.rerun()
+
+    with btn_c2:
+        if step == 2:
+            if st.button(
+                "✅ Continue",
+                type="primary",
+                disabled=has_pending,
+                key="ar_btn_confirm_discovery",
+            ):
+                with st.spinner("Analysing KPI formulas and grouping files…"):
+                    try:
+                        kpi_result_obj = run_kpi_phase(bundles, config)
+                        st.session_state[_SS_KPI] = kpi_result_obj
+                        kpi_analysis = kpi_result_obj.output if kpi_result_obj else None
+                        consol = run_consolidation_phase(bundles, config, kpi_result=kpi_analysis)
+                        st.session_state[_SS_CONSOLIDATION] = consol
+                    except Exception as exc:
+                        st.error(f"Analysis failed: `{type(exc).__name__}: {exc}`")
+                        st.code(traceback.format_exc(), language="python")
+                        return
+                _set_step(3)
+                st.rerun()
 
 
 # ── Consolidation workspace helpers ──────────────────────────────────────────
