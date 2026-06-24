@@ -82,6 +82,7 @@ def _reset_state() -> None:
         _SS_SOURCE_TAB_OVERRIDES, _SS_GROUP_OVERRIDES, _SS_KPI_ALIGN_DECISIONS,
         _SS_STRUCT_CACHE, _SS_BLOCKS_CACHE,
         _OVERRIDES_KEY, _ACTION_KEY, "ar_kpi_tab_overrides", "ar_detection_type_overrides",
+        "ar_disc_tags", "ar_disc_explorer_tab", "ar_disc_selected_block",
     ]:
         st.session_state.pop(key, None)
 
@@ -367,18 +368,17 @@ def _render_step_1() -> None:
         st.info("Upload at least one workbook to begin.")
         return
 
-    if st.button("▶ Run Discovery", type="primary", key="ar_btn_discovery"):
-        with st.spinner("Loading workbooks…"):
-            try:
-                bundles = [load_workbook_from_bytes(f.read(), file_name=f.name) for f in uploaded]
-            except Exception as exc:
-                st.error(f"Failed to load workbooks: `{type(exc).__name__}: {exc}`")
-                st.code(traceback.format_exc(), language="python")
-                return
-        st.session_state[_SS_BUNDLES] = bundles
-        st.session_state.pop(_SS_DISCOVERY, None)
-        _set_step(2)
-        st.rerun()
+    with st.spinner("Loading workbooks…"):
+        try:
+            bundles = [load_workbook_from_bytes(f.read(), file_name=f.name) for f in uploaded]
+        except Exception as exc:
+            st.error(f"Failed to load workbooks: `{type(exc).__name__}: {exc}`")
+            st.code(traceback.format_exc(), language="python")
+            return
+    st.session_state[_SS_BUNDLES] = bundles
+    st.session_state.pop(_SS_DISCOVERY, None)
+    _set_step(2)
+    st.rerun()
 
 
 def _tab_structure_label(bundle, sheet_name: str, discovery_result: "AgentResult | None") -> str:
@@ -432,14 +432,12 @@ def _render_step_2() -> None:
     if step != 2:
         return
 
-    st.subheader("Step 2 — Discovery")
-
     bundles = st.session_state.get(_SS_BUNDLES, [])
     if not bundles:
         st.warning("No bundles loaded. Return to Step 1.")
         return
 
-    # ── Phase 1: workbook structural analysis (cached — only runs once per upload) ──
+    # -- Phase 1: structural analysis (cached) --------------------------------
     from src.ingestion.workbook_analyzer import analyze_many
     wb_analyses = st.session_state.get(_SS_WB_ANALYSES)
     if wb_analyses is None:
@@ -452,7 +450,7 @@ def _render_step_2() -> None:
                 return
         st.session_state[_SS_WB_ANALYSES] = wb_analyses
 
-    # ── Phase 2: build RationalizationConfig from cached analyses (fast) ─────
+    # -- Phase 2: build RationalizationConfig (fast, uses cached analyses) ----
     discovery_result: AgentResult | None = st.session_state.get(_SS_DISCOVERY)
     if discovery_result is None:
         src_overrides = st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {})
@@ -482,201 +480,223 @@ def _render_step_2() -> None:
         st.error("Discovery did not produce a configuration.")
         return
 
-    # ── Workbook selector ─────────────────────────────────────────────────────
-    wb_names = [b.file_name for b in bundles]
-    selected_wb = st.selectbox(
-        "Workbook",
-        wb_names,
-        key="ar_disc_selected_wb",
-        label_visibility="visible",
-    )
-    bundle = next(b for b in bundles if b.file_name == selected_wb)
-    wb_cfg = config.config_for(selected_wb)
-    source_tab = (st.session_state.get(_SS_SOURCE_TAB_OVERRIDES, {}).get(selected_wb)
-                  or (wb_cfg.source_tab if wb_cfg else ""))
-    kpi_tabs   = (st.session_state.get("ar_kpi_tab_overrides", {}).get(selected_wb)
-                  or (wb_cfg.kpi_tabs if wb_cfg else []))
-    all_sheets = list(bundle.sheets.keys())
-
-    # ── Pending tag edits — stored per workbook ───────────────────────────────
-    # ar_disc_tags: {wb_name: {sheet_name: "Source"|"KPI"|"Ignore"}}
+    # -- Pending tag edits keyed by (wb_name, sheet_name) ---------------------
     _SS_DISC_TAGS = "ar_disc_tags"
     all_tags: dict[str, dict[str, str]] = st.session_state.get(_SS_DISC_TAGS, {})
-    # Initialise tags for this workbook if not set
-    if selected_wb not in all_tags:
-        all_tags[selected_wb] = {
-            s: _infer_tab_tag(s, source_tab, kpi_tabs) for s in all_sheets
-        }
-        st.session_state[_SS_DISC_TAGS] = all_tags
-    current_tags: dict[str, str] = all_tags[selected_wb]
 
-    # Committed tags (what discovery was actually run with)
-    committed_tags: dict[str, str] = {
-        s: _infer_tab_tag(s, source_tab, kpi_tabs) for s in all_sheets
-    }
-    has_pending = current_tags != committed_tags
+    for bundle in bundles:
+        wb_name = bundle.file_name
+        if wb_name not in all_tags:
+            wb_cfg = config.config_for(wb_name)
+            src  = wb_cfg.source_tab if wb_cfg else ""
+            kpis = wb_cfg.kpi_tabs if wb_cfg else []
+            all_tags[wb_name] = {s: _infer_tab_tag(s, src, kpis) for s in bundle.sheets}
+    st.session_state[_SS_DISC_TAGS] = all_tags
 
-    # ── Tabs table ────────────────────────────────────────────────────────────
-    st.markdown("**Tabs**")
+    def _committed(wb_name: str) -> dict[str, str]:
+        wb_cfg = config.config_for(wb_name)
+        src  = wb_cfg.source_tab if wb_cfg else ""
+        kpis = wb_cfg.kpi_tabs if wb_cfg else []
+        bnd  = next(b for b in bundles if b.file_name == wb_name)
+        return {s: _infer_tab_tag(s, src, kpis) for s in bnd.sheets}
+
+    has_pending = any(
+        all_tags.get(b.file_name, {}) != _committed(b.file_name)
+        for b in bundles
+    )
+
+    st.subheader("Step 2 — Discovery")
+
     _TAG_OPTIONS = ["Source", "KPI", "Ignore"]
-    col_tab, col_tag, col_struct, col_rows, col_cols = st.columns([3, 2, 2, 1, 1])
-    col_tab.markdown("**Tab Name**")
-    col_tag.markdown("**Tag**")
-    col_struct.markdown("**Structure**")
-    col_rows.markdown("**Rows**")
-    col_cols.markdown("**Cols**")
 
-    for sheet_name in all_sheets:
-        df_sheet = bundle.sheets.get(sheet_name)
-        n_rows = len(df_sheet) if df_sheet is not None else 0
-        n_cols = len(df_sheet.columns) if df_sheet is not None else 0
-        struct = _tab_structure_label(bundle, sheet_name, discovery_result)
+    # -- Workbook cards --------------------------------------------------------
+    for bundle in bundles:
+        wb_name    = bundle.file_name
+        all_sheets = list(bundle.sheets.keys())
+        cur_tags   = all_tags.get(wb_name, {})
+        n_source   = sum(1 for t in cur_tags.values() if t == "Source")
+        n_kpi      = sum(1 for t in cur_tags.values() if t == "KPI")
 
-        c_tab, c_tag, c_struct, c_rows, c_cols = st.columns([3, 2, 2, 1, 1])
-        with c_tab:
-            # Clicking the tab name sets it as the column-explorer target
-            if st.button(sheet_name, key=f"ar_disc_sel_{selected_wb}_{sheet_name}", use_container_width=True):
-                st.session_state["ar_disc_explorer_tab"] = (selected_wb, sheet_name)
-        with c_tag:
-            current_tag = current_tags.get(sheet_name, "Ignore")
-            new_tag = st.selectbox(
-                "tag",
-                _TAG_OPTIONS,
-                index=_TAG_OPTIONS.index(current_tag),
-                key=f"ar_disc_tag_{selected_wb}_{sheet_name}",
-                label_visibility="collapsed",
-            )
-            if new_tag != current_tag:
-                current_tags[sheet_name] = new_tag
-                all_tags[selected_wb] = current_tags
-                st.session_state[_SS_DISC_TAGS] = all_tags
-                has_pending = True
-                st.rerun()
-        c_struct.markdown(struct)
-        c_rows.markdown(str(n_rows))
-        c_cols.markdown(str(n_cols))
+        with st.expander(
+            f"**{wb_name}**  —  {len(all_sheets)} sheets · {n_source} source · {n_kpi} KPI",
+            expanded=True,
+        ):
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Sheets",      len(all_sheets))
+            sc2.metric("Source Tabs", n_source)
+            sc3.metric("KPI Tabs",    n_kpi)
 
-    # ── Column Explorer ───────────────────────────────────────────────────────
+            st.markdown("")
+            h_tab, h_tag, h_struct, h_rows, h_cols = st.columns([3, 2, 2, 1, 1])
+            h_tab.markdown("**Tab Name**")
+            h_tag.markdown("**Tag**")
+            h_struct.markdown("**Structure**")
+            h_rows.markdown("**Rows**")
+            h_cols.markdown("**Cols**")
+
+            for sheet_name in all_sheets:
+                df_sheet = bundle.sheets.get(sheet_name)
+                n_rows  = len(df_sheet) if df_sheet is not None else 0
+                n_cols  = len(df_sheet.columns) if df_sheet is not None else 0
+                struct  = _tab_structure_label(bundle, sheet_name, discovery_result)
+
+                r_tab, r_tag, r_struct, r_rows, r_cols = st.columns([3, 2, 2, 1, 1])
+                with r_tab:
+                    if st.button(
+                        sheet_name,
+                        key=f"ar_disc_sel_{wb_name}_{sheet_name}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["ar_disc_explorer_tab"] = (wb_name, sheet_name)
+                        st.session_state.pop("ar_disc_selected_block", None)
+                        st.rerun()
+                with r_tag:
+                    current_tag = cur_tags.get(sheet_name, "Ignore")
+                    new_tag = st.selectbox(
+                        "tag",
+                        _TAG_OPTIONS,
+                        index=_TAG_OPTIONS.index(current_tag),
+                        key=f"ar_disc_tag_{wb_name}_{sheet_name}",
+                        label_visibility="collapsed",
+                    )
+                    if new_tag != current_tag:
+                        cur_tags[sheet_name] = new_tag
+                        all_tags[wb_name] = cur_tags
+                        st.session_state[_SS_DISC_TAGS] = all_tags
+                        st.rerun()
+                r_struct.markdown(struct)
+                r_rows.markdown(str(n_rows))
+                r_cols.markdown(str(n_cols))
+
+    # -- Tab Explorer ----------------------------------------------------------
     explorer_target = st.session_state.get("ar_disc_explorer_tab")
-    # Default to source tab on first render
-    if explorer_target is None or explorer_target[0] != selected_wb:
-        if source_tab in all_sheets:
-            explorer_target = (selected_wb, source_tab)
-            st.session_state["ar_disc_explorer_tab"] = explorer_target
+    if explorer_target:
+        exp_wb_name, exp_sheet = explorer_target
+        exp_bundle = next((b for b in bundles if b.file_name == exp_wb_name), None)
+        if exp_bundle is not None:
+            exp_df       = exp_bundle.sheets.get(exp_sheet)
+            exp_tag      = all_tags.get(exp_wb_name, {}).get(exp_sheet, "Ignore")
+            struct_label = _tab_structure_label(exp_bundle, exp_sheet, discovery_result)
 
-    if explorer_target and explorer_target[0] == selected_wb:
-        explorer_sheet = explorer_target[1]
-        df_exp = bundle.sheets.get(explorer_sheet)
-        if df_exp is not None:
             st.markdown("---")
-            st.markdown(f"**Selected Tab: `{explorer_sheet}`**")
-            explorer_tag = current_tags.get(explorer_sheet, "Ignore")
+            st.markdown(f"### {exp_sheet}")
 
-            # For KPI tabs, attempt block-level structure detection (result cached).
-            # For pivot-based tabs: always use pivot metadata (report filters /
-            # row / column fields → dimensions; data fields → measures).
-            # For formula-based tabs: scan visible cells for multi-block structure.
-            kpi_blocks = []
-            if explorer_tag == "KPI":
-                blocks_cache: dict = st.session_state.setdefault(_SS_BLOCKS_CACHE, {})
-                cache_key = (selected_wb, explorer_sheet)
-                if cache_key not in blocks_cache:
-                    raw_wb = getattr(bundle, "_raw_wb", None)
-                    raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
-                    if raw_ws is not None and getattr(raw_ws, "_pivots", []):
-                        # Pivot sheet: use metadata exclusively
-                        blocks_cache[cache_key] = build_kpi_blocks_from_pivot(raw_wb, explorer_sheet)
+            if exp_tag in ("Source", "Ignore"):
+                n_rows = len(exp_df) if exp_df is not None else 0
+                n_cols = len(exp_df.columns) if exp_df is not None else 0
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Rows",      f"{n_rows:,}")
+                mc2.metric("Columns",   n_cols)
+                mc3.metric("Structure", struct_label)
+
+                if exp_df is not None:
+                    col_rows_data = []
+                    for col in exp_df.columns:
+                        col_str = str(col)
+                        if col_str.startswith("Unnamed:"):
+                            continue
+                        dtype = exp_df[col].dtype
+                        if "datetime" in str(dtype):
+                            dtype_label = "Date"
+                        elif "bool" in str(dtype):
+                            dtype_label = "Boolean"
+                        elif str(dtype).startswith(("int", "float")):
+                            dtype_label = "Numeric"
+                        else:
+                            col_lower = col_str.lower()
+                            if any(kw in col_lower for kw in ("date", "period", "month", "year", "day")):
+                                dtype_label = "Date"
+                            else:
+                                dtype_label = "Text"
+                        col_rows_data.append({"Column Name": col_str, "Data Type": dtype_label})
+                    if col_rows_data:
+                        st.dataframe(
+                            pd.DataFrame(col_rows_data),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                     else:
-                        # Formula-based sheet: scan visible cells
+                        st.info("No readable columns found in this tab.")
+
+            elif exp_tag == "KPI":
+                blocks_cache: dict = st.session_state.setdefault(_SS_BLOCKS_CACHE, {})
+                cache_key = (exp_wb_name, exp_sheet)
+                if cache_key not in blocks_cache:
+                    raw_wb = getattr(exp_bundle, "_raw_wb", None)
+                    raw_ws = _get_raw_ws(raw_wb, exp_sheet)
+                    if raw_ws is not None and getattr(raw_ws, "_pivots", []):
+                        blocks_cache[cache_key] = build_kpi_blocks_from_pivot(raw_wb, exp_sheet)
+                    else:
                         blocks_cache[cache_key] = scan_kpi_blocks(raw_ws) if raw_ws is not None else []
                 kpi_blocks = blocks_cache[cache_key]
 
-            struct_label = _tab_structure_label(bundle, explorer_sheet, discovery_result)
-            if kpi_blocks:
-                struct_label = "Multi-Block KPI"
+                n_rows = len(exp_df) if exp_df is not None else 0
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Rows",       f"{n_rows:,}")
+                mc2.metric("KPI Blocks", len(kpi_blocks))
+                mc3.metric("Structure",  struct_label)
 
-            ec1, ec2, ec3 = st.columns(3)
-            ec1.metric("Rows", f"{len(df_exp):,}")
-            if kpi_blocks:
-                total_measures = sum(len(b.kpi_measures) for b in kpi_blocks)
-                ec2.metric("KPI Blocks", len(kpi_blocks))
-                ec3.metric("KPI Measures", total_measures)
-            else:
-                ec2.metric("Columns", len(df_exp.columns))
-                ec3.metric("Structure", struct_label)
+                if kpi_blocks:
+                    _SS_SEL_BLOCK = "ar_disc_selected_block"
+                    selected_block_name = st.session_state.get(_SS_SEL_BLOCK)
+                    block_names = [blk.block_name for blk in kpi_blocks]
+                    if selected_block_name not in block_names:
+                        selected_block_name = block_names[0]
+                        st.session_state[_SS_SEL_BLOCK] = selected_block_name
 
-            if kpi_blocks:
-                # ── Block-level KPI structure display ────────────────────────
-                st.caption(f"{len(kpi_blocks)} KPI block(s) detected — expand to see dimensions and measures.")
-                for blk in kpi_blocks:
-                    n_kpi = len(blk.kpi_measures)
-                    n_dim = len(blk.dimensions)
-                    with st.expander(f"{blk.block_name}  ({n_kpi} KPI{'s' if n_kpi != 1 else ''})", expanded=False):
-                        if blk.dimensions:
-                            st.markdown("**Dimensions**")
-                            for dim in blk.dimensions:
-                                st.markdown(f"- {dim}")
-                        st.markdown("**KPI Measures**")
-                        for measure in blk.kpi_measures:
-                            agg = getattr(measure, "aggregation", "")
-                            agg_tag = f" `{agg}`" if agg else ""
-                            st.markdown(f"- {measure.display_name}{agg_tag}")
-            else:
-                # ── Flat column list (source tab or KPI tab with no blocks) ──
-                col_rows_data = []
-                for col in df_exp.columns:
-                    col_str = str(col)
-                    # Skip unnamed columns for KPI tabs
-                    if explorer_tag == "KPI" and col_str.startswith("Unnamed:"):
-                        continue
-                    dtype = df_exp[col].dtype
-                    if str(dtype).startswith("int") or str(dtype).startswith("float"):
-                        dtype_label = "Numeric"
-                    elif str(dtype) in ("object", "string"):
-                        col_lower = col_str.lower()
-                        if any(kw in col_lower for kw in ("date", "period", "month", "year", "day")):
-                            dtype_label = "Date"
-                        else:
-                            dtype_label = "Text"
-                    elif "datetime" in str(dtype):
-                        dtype_label = "Date"
-                    elif "bool" in str(dtype):
-                        dtype_label = "Boolean"
-                    else:
-                        dtype_label = str(dtype)
-                    col_rows_data.append({"Column Name": col_str, "Data Type": dtype_label})
-                if col_rows_data:
-                    st.dataframe(
-                        pd.DataFrame(col_rows_data),
-                        use_container_width=True,
-                        hide_index=True,
+                    st.markdown("**KPI Blocks**")
+                    n_chips   = len(kpi_blocks)
+                    chip_cols = st.columns(min(n_chips, 8))
+                    for i, blk in enumerate(kpi_blocks):
+                        with chip_cols[i % len(chip_cols)]:
+                            is_sel = blk.block_name == selected_block_name
+                            if st.button(
+                                blk.block_name,
+                                key=f"ar_kpi_chip_{exp_wb_name}_{exp_sheet}_{i}",
+                                type="primary" if is_sel else "secondary",
+                                use_container_width=True,
+                            ):
+                                st.session_state[_SS_SEL_BLOCK] = blk.block_name
+                                st.rerun()
+
+                    sel_blk = next(
+                        (b for b in kpi_blocks if b.block_name == selected_block_name),
+                        kpi_blocks[0],
                     )
+                    st.markdown("")
+                    dim_col, meas_col = st.columns(2)
+                    with dim_col:
+                        st.markdown("**Dimensions**")
+                        if sel_blk.dimensions:
+                            for dim in sel_blk.dimensions:
+                                st.markdown(f"- {dim}")
+                        else:
+                            st.caption("—")
+                    with meas_col:
+                        st.markdown("**Measures**")
+                        if sel_blk.kpi_measures:
+                            for m in sel_blk.kpi_measures:
+                                st.markdown(f"- {m.display_name}")
+                        else:
+                            st.caption("—")
                 else:
-                    st.info("No readable columns found in this tab.")
+                    st.info("No KPI blocks detected in this tab.")
 
-    # ── Action buttons ────────────────────────────────────────────────────────
+    # -- Action buttons -------------------------------------------------------
     st.markdown("---")
-    btn_c1, btn_c2 = st.columns([1, 1])
-
-    with btn_c1:
-        if st.button(
-            "🔄 Update Discovery",
-            disabled=not has_pending,
-            key="ar_btn_update_discovery",
-        ):
-            # Apply pending tags as overrides and re-run discovery
+    if has_pending:
+        if st.button("Apply Changes", type="primary", key="ar_btn_apply_changes"):
             new_src_overrides: dict[str, str] = {}
             new_kpi_overrides: dict[str, list[str]] = {}
             for wb_n, tag_map in all_tags.items():
-                src = next((s for s, t in tag_map.items() if t == "Source"), "")
+                src  = next((s for s, t in tag_map.items() if t == "Source"), "")
                 kpis = [s for s, t in tag_map.items() if t == "KPI"]
                 if src:
                     new_src_overrides[wb_n] = src
                 if kpis:
                     new_kpi_overrides[wb_n] = kpis
             st.session_state[_SS_SOURCE_TAB_OVERRIDES] = new_src_overrides
-            st.session_state["ar_kpi_tab_overrides"] = new_kpi_overrides
-            # Clear discovery + downstream; keep _SS_WB_ANALYSES so re-run is fast
+            st.session_state["ar_kpi_tab_overrides"]   = new_kpi_overrides
             st.session_state.pop(_SS_DISCOVERY, None)
             st.session_state.pop(_SS_CONSOLIDATION, None)
             st.session_state.pop(_SS_SCHEMA, None)
@@ -684,13 +704,11 @@ def _render_step_2() -> None:
             st.session_state.pop(_SS_STRUCT_CACHE, None)
             st.session_state.pop(_SS_DISC_TAGS, None)
             st.rerun()
-
-    with btn_c2:
+    else:
         if step == 2:
             if st.button(
-                "✅ Continue",
+                "Confirm Discovery & Continue",
                 type="primary",
-                disabled=has_pending,
                 key="ar_btn_confirm_discovery",
             ):
                 with st.spinner("Analysing KPI formulas and grouping files…"):
@@ -707,8 +725,6 @@ def _render_step_2() -> None:
                 _set_step(3)
                 st.rerun()
 
-
-# ── Consolidation workspace helpers ──────────────────────────────────────────
 
 def _build_column_mapping_xlsx(intel) -> bytes:
     """Column Mapping: canonical → per-file raw column name."""
