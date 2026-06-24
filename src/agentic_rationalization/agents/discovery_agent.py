@@ -135,7 +135,7 @@ def run(
             if tab.is_pivot_sheet:
                 conf = 0.99
             elif tab.tab_type == TabType.SOURCE_DATA and any(
-                tab.tab_name in p.source_sheets
+                tab.tab_name in p.pivot_source_tabs
                 for p in _get_pivot_infos_for_wb(analysis)
             ):
                 conf = 0.97  # pivot-traced source tab → very high confidence
