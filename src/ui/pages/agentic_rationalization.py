@@ -18,6 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from src.ingestion.loader import load_workbook_from_bytes
+from src.ingestion.workbook_analyzer import scan_kpi_blocks, _get_raw_ws
 from src.agentic_rationalization.orchestrator import run_pipeline
 from src.agentic_rationalization.pipeline_phases import (
     run_discovery_phase,
@@ -501,37 +502,75 @@ def _render_step_2() -> None:
         if df_exp is not None:
             st.markdown("---")
             st.markdown(f"**Selected Tab: `{explorer_sheet}`**")
+            explorer_tag = current_tags.get(explorer_sheet, "Ignore")
+
+            # For KPI tabs, attempt block-level structure detection
+            kpi_blocks = []
+            if explorer_tag == "KPI":
+                raw_wb = getattr(bundle, "_raw_wb", None)
+                raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
+                kpi_blocks = scan_kpi_blocks(raw_ws) if raw_ws is not None else []
+
             struct_label = _tab_structure_label(bundle, explorer_sheet, discovery_result)
+            if kpi_blocks:
+                struct_label = "Multi-Block KPI"
+
             ec1, ec2, ec3 = st.columns(3)
             ec1.metric("Rows", f"{len(df_exp):,}")
-            ec2.metric("Columns", len(df_exp.columns))
-            ec3.metric("Structure", struct_label)
+            if kpi_blocks:
+                total_measures = sum(len(b.kpi_measures) for b in kpi_blocks)
+                ec2.metric("KPI Blocks", len(kpi_blocks))
+                ec3.metric("KPI Measures", total_measures)
+            else:
+                ec2.metric("Columns", len(df_exp.columns))
+                ec3.metric("Structure", struct_label)
 
-            # Column table
-            col_rows_data = []
-            for col in df_exp.columns:
-                dtype = df_exp[col].dtype
-                if str(dtype).startswith("int") or str(dtype).startswith("float"):
-                    dtype_label = "Numeric"
-                elif str(dtype) in ("object", "string"):
-                    # Try to detect date-like columns by name
-                    col_lower = str(col).lower()
-                    if any(kw in col_lower for kw in ("date", "period", "month", "year", "day")):
+            if kpi_blocks:
+                # ── Block-level KPI structure display ────────────────────────
+                st.caption(f"{len(kpi_blocks)} KPI block(s) detected — expand to see dimensions and measures.")
+                for blk in kpi_blocks:
+                    n_kpi = len(blk.kpi_measures)
+                    n_dim = len(blk.dimensions)
+                    with st.expander(f"{blk.block_name}  ({n_kpi} KPI{'s' if n_kpi != 1 else ''})", expanded=False):
+                        if blk.dimensions:
+                            st.markdown("**Dimensions**")
+                            for dim in blk.dimensions:
+                                st.markdown(f"- {dim}")
+                        st.markdown("**KPI Measures**")
+                        for measure in blk.kpi_measures:
+                            st.markdown(f"- {measure}")
+            else:
+                # ── Flat column list (source tab or KPI tab with no blocks) ──
+                col_rows_data = []
+                for col in df_exp.columns:
+                    col_str = str(col)
+                    # Skip unnamed columns for KPI tabs
+                    if explorer_tag == "KPI" and col_str.startswith("Unnamed:"):
+                        continue
+                    dtype = df_exp[col].dtype
+                    if str(dtype).startswith("int") or str(dtype).startswith("float"):
+                        dtype_label = "Numeric"
+                    elif str(dtype) in ("object", "string"):
+                        col_lower = col_str.lower()
+                        if any(kw in col_lower for kw in ("date", "period", "month", "year", "day")):
+                            dtype_label = "Date"
+                        else:
+                            dtype_label = "Text"
+                    elif "datetime" in str(dtype):
                         dtype_label = "Date"
+                    elif "bool" in str(dtype):
+                        dtype_label = "Boolean"
                     else:
-                        dtype_label = "Text"
-                elif "datetime" in str(dtype):
-                    dtype_label = "Date"
-                elif "bool" in str(dtype):
-                    dtype_label = "Boolean"
+                        dtype_label = str(dtype)
+                    col_rows_data.append({"Column Name": col_str, "Data Type": dtype_label})
+                if col_rows_data:
+                    st.dataframe(
+                        pd.DataFrame(col_rows_data),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
                 else:
-                    dtype_label = str(dtype)
-                col_rows_data.append({"Column Name": str(col), "Data Type": dtype_label})
-            st.dataframe(
-                pd.DataFrame(col_rows_data),
-                use_container_width=True,
-                hide_index=True,
-            )
+                    st.info("No readable columns found in this tab.")
 
     # ── Action buttons ────────────────────────────────────────────────────────
     st.markdown("---")

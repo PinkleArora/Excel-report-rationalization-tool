@@ -43,6 +43,7 @@ from src.agentic_rationalization.models import AgentDecision, AgentResult
 from src.agentic_rationalization.grain_detector import detect_grain, GrainDetectionResult
 from src.agentic_rationalization.compatibility_scorer import score_compatibility, CompatibilityScore
 from src.schema_matching.normalizer import normalize_column_name
+from src.ingestion.workbook_analyzer import scan_kpi_blocks, _get_raw_ws
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ class WorkbookKpiStats:
     detection_confidence: float
     reason_if_empty: str     # e.g. "No formulas found" if kpi_column_count == 0
     detection_type: str = "Formula-Based"  # "Formula-Based" | "Pivot-Based" | "Mixed"
+    kpi_blocks: list = field(default_factory=list)  # list[KpiBlock] per KPI tab
 
 
 @dataclass
@@ -488,6 +490,7 @@ def _compute_workbook_kpi_stats(
     file_names: list[str],
     kpi_result,
     config,
+    kpi_blocks_by_file: "dict[str, list] | None" = None,
 ) -> list[WorkbookKpiStats]:
     """Compute per-workbook KPI discovery statistics."""
     stats: list[WorkbookKpiStats] = []
@@ -503,6 +506,15 @@ def _compute_workbook_kpi_stats(
         for d in file_deps:
             kpi_canonicals.update(d.canonical_source_columns)
         kpi_col_count = len(kpi_canonicals)
+
+        # If block data is available and formula-based count is zero, use block
+        # measure count as a more accurate KPI column count
+        blocks = (kpi_blocks_by_file or {}).get(fname, [])
+        if kpi_col_count == 0 and blocks:
+            block_measures: set[str] = set()
+            for blk in blocks:
+                block_measures.update(getattr(blk, "kpi_measures", []))
+            kpi_col_count = len(block_measures)
 
         if kpi_col_count > 0:
             confidence = 0.95
@@ -537,6 +549,7 @@ def _compute_workbook_kpi_stats(
             detection_confidence=confidence,
             reason_if_empty=reason,
             detection_type=detection_type,
+            kpi_blocks=blocks,
         ))
     return stats
 
@@ -600,18 +613,37 @@ def _compute_kpi_redundancy(
     col_map: dict[str, list[str]],
     kpi_referenced: set[str],
     grain_map: dict[str, "GrainDetectionResult"],
+    kpi_blocks_by_file: "dict[str, list] | None" = None,
 ) -> list["FileRedundancyResult"]:
     """Determine which files are KPI-redundant.
 
-    A file is redundant when every KPI-referenced column it contains is also
-    present in at least one other file with compatible grain.  Non-KPI columns
-    are irrelevant to this decision.
+    When ``kpi_blocks_by_file`` is provided, comparison is performed at
+    block-level KPI measure name granularity — a file is redundant only when
+    every KPI measure defined in its blocks is also present in another file's
+    blocks.  When block data is absent, falls back to canonical source-column
+    comparison.
+
+    Non-KPI / non-block columns are never considered for this decision.
     """
-    # Build per-file set of KPI columns (normalized)
-    kpi_by_file: dict[str, set[str]] = {}
-    for fname in file_names:
-        normed = {normalize_column_name(c) for c in col_map.get(fname, [])}
-        kpi_by_file[fname] = normed & kpi_referenced
+    # ── Block-level comparison (preferred when available) ────────────────────
+    if kpi_blocks_by_file:
+        # Build per-file set of KPI measure names (normalised)
+        kpi_by_file: dict[str, set[str]] = {}
+        for fname in file_names:
+            blocks = kpi_blocks_by_file.get(fname, [])
+            measures: set[str] = set()
+            for blk in blocks:
+                for m in getattr(blk, "kpi_measures", []):
+                    measures.add(normalize_column_name(str(m)))
+            kpi_by_file[fname] = measures
+        _using_blocks = True
+    else:
+        # ── Fallback: canonical source-column comparison ──────────────────────
+        kpi_by_file = {}
+        for fname in file_names:
+            normed = {normalize_column_name(c) for c in col_map.get(fname, [])}
+            kpi_by_file[fname] = normed & kpi_referenced
+        _using_blocks = False
 
     results: list[FileRedundancyResult] = []
     for fname in file_names:
@@ -626,7 +658,11 @@ def _compute_kpi_redundancy(
                 covered_by=[],
                 redundant=False,
                 recommendation="Retain",
-                reason="No KPI-referenced columns detected — cannot assess redundancy.",
+                reason=(
+                    "No KPI block measures detected — cannot assess redundancy."
+                    if _using_blocks
+                    else "No KPI-referenced columns detected — cannot assess redundancy."
+                ),
             ))
             continue
 
@@ -660,28 +696,31 @@ def _compute_kpi_redundancy(
                     if found:
                         break
 
+            _kpi_label = "KPI measure(s)" if _using_blocks else "KPI column(s)"
             recommendation = "Discard"
             reason = (
-                f"All {total_kpi} KPI column(s) in this file are already available in "
+                f"All {total_kpi} {_kpi_label} in this file are already available in "
                 f"{', '.join(covered_by) if covered_by else 'other files'}. "
                 "No unique KPIs contributed. "
                 "Retaining this file adds no KPI coverage."
             )
             redundant = True
         elif len(unique_kpis) < total_kpi:
+            _kpi_label = "KPI measure(s)" if _using_blocks else "KPI column(s)"
             recommendation = "Partial — review unique KPIs"
             reason = (
-                f"{total_kpi - len(unique_kpis)} of {total_kpi} KPI column(s) are covered "
+                f"{total_kpi - len(unique_kpis)} of {total_kpi} {_kpi_label} are covered "
                 f"by other files. "
-                f"{len(unique_kpis)} unique KPI column(s) not found elsewhere: "
+                f"{len(unique_kpis)} unique {_kpi_label} not found elsewhere: "
                 f"{', '.join(sorted(unique_kpis)[:5])}{'…' if len(unique_kpis) > 5 else ''}. "
                 "Review whether these unique KPIs are required."
             )
             redundant = False
         else:
+            _kpi_label = "KPI measure(s)" if _using_blocks else "KPI column(s)"
             recommendation = "Retain"
             reason = (
-                f"All {total_kpi} KPI column(s) are unique to this file — "
+                f"All {total_kpi} {_kpi_label} are unique to this file — "
                 "no other file provides equivalent KPI coverage."
             )
             redundant = False
@@ -891,11 +930,32 @@ def run(
         exclude_files=[],
     )
 
+    # ── KPI block scan (for block-level redundancy and UI display) ────────────
+    kpi_blocks_by_file: dict[str, list] = {}
+    for bundle in bundles:
+        fname = getattr(bundle, "file_name", str(bundle))
+        wb_cfg = config.config_for(fname)
+        if wb_cfg is None:
+            continue
+        raw_wb = getattr(bundle, "_raw_wb", None)
+        all_blocks: list = []
+        for kpi_tab in (wb_cfg.kpi_tabs or []):
+            raw_ws = _get_raw_ws(raw_wb, kpi_tab)
+            if raw_ws is not None:
+                tab_blocks = scan_kpi_blocks(raw_ws)
+                all_blocks.extend(tab_blocks)
+        if all_blocks:
+            kpi_blocks_by_file[fname] = all_blocks
+
     kpi_alignments = _compute_kpi_alignments(
         file_names, col_map, kpi_referenced, kpi_label_map, kpi_result
     )
-    wb_kpi_stats = _compute_workbook_kpi_stats(file_names, kpi_result, config)
-    kpi_redundancy = _compute_kpi_redundancy(file_names, col_map, kpi_referenced, grain_map)
+    wb_kpi_stats = _compute_workbook_kpi_stats(
+        file_names, kpi_result, config, kpi_blocks_by_file
+    )
+    kpi_redundancy = _compute_kpi_redundancy(
+        file_names, col_map, kpi_referenced, grain_map, kpi_blocks_by_file or None
+    )
 
     intelligence_result = ConsolidationIntelligenceResult(
         file_profiles=file_profiles,

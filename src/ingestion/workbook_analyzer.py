@@ -138,6 +138,24 @@ class SignalVector:
 
 
 @dataclass
+class KpiBlock:
+    """A self-contained KPI section within a summary/KPI tab.
+
+    Many actuarial reserve worksheets contain multiple named sections — each
+    with a title row, a header row defining dimensions and KPI measure columns,
+    and several data rows.  For example, a "Summary" tab might contain separate
+    blocks for "STAT Reserve", "Tax Reserves", "GAAP Ben Reserves", etc.
+    """
+
+    block_name: str           # section title, e.g. "STAT Reserve"
+    dimensions: list[str]     # row-label columns (text), e.g. ["Product Subtype"]
+    kpi_measures: list[str]   # KPI/measure column names from the header row
+    header_row: int           # 1-based worksheet row index of the block header
+    data_start_row: int       # 1-based row index of the first data row
+    data_end_row: int         # 1-based row index of the last data row
+
+
+@dataclass
 class TabAnalysis:
     """Classification result for a single worksheet."""
 
@@ -157,6 +175,8 @@ class TabAnalysis:
     is_pivot_sheet: bool = False             # True when this sheet has pivot tables
     pivot_source_tabs: list[str] = field(default_factory=list)   # sheets feeding this pivot
     pivot_value_fields: list[str] = field(default_factory=list)  # measure/KPI field names
+    # Multi-block KPI structure — populated for KPI_SUMMARY / DASHBOARD / OUTPUT tabs
+    kpi_blocks: list[KpiBlock] = field(default_factory=list)
 
 
 @dataclass
@@ -479,6 +499,15 @@ def analyze_workbook(
                     "Extracted %d KPI definition(s) from '%s/%s'",
                     len(kpis), wb_name, sheet_name,
                 )
+            # Detect multi-block structure for KPI/summary tabs
+            if tab.tab_type in (TabType.KPI_SUMMARY, TabType.DASHBOARD, TabType.OUTPUT):
+                tab.kpi_blocks = scan_kpi_blocks(raw_ws)
+                if tab.kpi_blocks:
+                    n_measures = sum(len(b.kpi_measures) for b in tab.kpi_blocks)
+                    logger.info(
+                        "KPI tab '%s/%s': %d block(s), %d measure(s) detected",
+                        wb_name, sheet_name, len(tab.kpi_blocks), n_measures,
+                    )
 
     analysis = WorkbookAnalysis(
         workbook_name=wb_name,
@@ -975,6 +1004,199 @@ def _detect_aggregate_function(formula: str) -> str:
     if m and m.group(1) in _AGGREGATE_FUNCS:
         return m.group(1)
     return "OTHER"
+
+
+# ---------------------------------------------------------------------------
+# KPI block scanner
+# ---------------------------------------------------------------------------
+
+_KPI_BLOCK_MAX_BLANK_GAP = 3  # consecutive blank rows that terminate a block
+
+
+def scan_kpi_blocks(raw_ws: Any, max_rows: int = 2_000) -> list[KpiBlock]:
+    """Detect multi-section (block) structure in a KPI/summary worksheet.
+
+    Many actuarial reserve summary tabs contain multiple self-contained sections,
+    each with a title row, a header row, and data rows.  This function identifies
+    those boundaries by detecting the pattern::
+
+        [title row: 1-3 text cells, no numbers]
+        [optional blank rows]
+        [header row: ≥2 text cells, no numbers]
+        [data rows: dimension text + KPI formulas/numbers]
+        [blank separator rows]
+        [next title ...]
+
+    Returns an empty list when no multi-block structure is found (i.e. the sheet
+    looks like a single flat table — normal DataFrame reading is appropriate).
+    """
+    if raw_ws is None:
+        return []
+
+    try:
+        raw_rows = []
+        for i, row in enumerate(raw_ws.iter_rows(values_only=True)):
+            if i >= max_rows:
+                break
+            raw_rows.append(row)
+    except Exception:
+        return []
+
+    if not raw_rows:
+        return []
+
+    n_cols = max(len(r) for r in raw_rows)
+    if n_cols == 0:
+        return []
+
+    # Pad rows to uniform width
+    rows: list[list] = [list(r) + [None] * (n_cols - len(r)) for r in raw_rows]
+    n_rows = len(rows)
+
+    def _blank(v: Any) -> bool:
+        return v is None or (isinstance(v, str) and v.strip() == "")
+
+    def _text(v: Any) -> bool:
+        return isinstance(v, str) and not v.startswith("=") and v.strip() != ""
+
+    def _numeric_or_formula(v: Any) -> bool:
+        if isinstance(v, (int, float)):
+            return True
+        return isinstance(v, str) and v.startswith("=")
+
+    def _row_stats(row: list) -> tuple[int, int, int]:
+        """Return (non_empty_count, text_count, numeric_or_formula_count)."""
+        ne = sum(1 for v in row if not _blank(v))
+        nt = sum(1 for v in row if _text(v))
+        nn = sum(1 for v in row if _numeric_or_formula(v))
+        return ne, nt, nn
+
+    rstats: list[tuple[int, int, int]] = [_row_stats(r) for r in rows]
+
+    def _next_nonempty(start: int) -> int:
+        for i in range(start, n_rows):
+            if rstats[i][0] > 0:
+                return i
+        return n_rows
+
+    # ── Find header rows ─────────────────────────────────────────────────────
+    # Header: ≥2 non-empty cells, ≥50% are text, zero numeric/formula cells,
+    # AND the immediately following non-blank row has ≥1 numeric/formula cell.
+    candidate_headers: list[int] = []
+    for i in range(n_rows):
+        ne, nt, nn = rstats[i]
+        if ne >= 2 and nn == 0 and nt >= max(1, ne * 0.5):
+            j = _next_nonempty(i + 1)
+            if j < n_rows and rstats[j][2] > 0:
+                candidate_headers.append(i)
+
+    if not candidate_headers:
+        return []
+
+    # Deduplicate adjacent candidates (keep the later one)
+    deduped: list[int] = []
+    for h in candidate_headers:
+        if deduped and h - deduped[-1] <= 1:
+            deduped[-1] = h
+        else:
+            deduped.append(h)
+    candidate_set: set[int] = set(deduped)
+
+    # ── Build one KpiBlock per header ────────────────────────────────────────
+    blocks: list[KpiBlock] = []
+
+    for h_idx in deduped:
+        # ── Title: look back up to 5 rows for a 1-3 cell pure-text row ──────
+        title = ""
+        for back in range(1, 6):
+            t = h_idx - back
+            if t < 0:
+                break
+            ne, nt, nn = rstats[t]
+            if ne == 0:
+                continue  # blank row — keep looking back
+            # Title: 1–3 non-empty cells, all text, no numeric values
+            if 1 <= ne <= 3 and nt == ne and nn == 0:
+                text_vals = [v for v in rows[t] if _text(v)]
+                if text_vals and len(str(text_vals[0]).strip()) > 2:
+                    title = str(text_vals[0]).strip()
+            break  # stop at the first non-blank row (title or not)
+
+        # ── Header column names ───────────────────────────────────────────────
+        col_names: list[str | None] = [
+            str(v).strip() if not _blank(v) else None
+            for v in rows[h_idx]
+        ]
+
+        # ── Collect data rows ─────────────────────────────────────────────────
+        k = h_idx + 1
+        data_start = k
+        data_end = h_idx
+        consecutive_blanks = 0
+        sample_txt: list[int] = [0] * n_cols
+        sample_num: list[int] = [0] * n_cols
+        sample_count = 0
+        data_row_indices: list[int] = []
+
+        while k < n_rows:
+            ne, nt, nn = rstats[k]
+            if ne == 0:
+                consecutive_blanks += 1
+                if consecutive_blanks >= _KPI_BLOCK_MAX_BLANK_GAP:
+                    break
+                k += 1
+                continue
+            consecutive_blanks = 0
+
+            # Stop at the next detected header
+            if k in candidate_set and k != h_idx:
+                break
+
+            data_end = k
+            data_row_indices.append(k)
+            if sample_count < 5:
+                for ci, v in enumerate(rows[k][:n_cols]):
+                    if _text(v):
+                        sample_txt[ci] += 1
+                    elif _numeric_or_formula(v):
+                        sample_num[ci] += 1
+                sample_count += 1
+            k += 1
+
+        if not data_row_indices:
+            continue
+
+        # ── Classify columns as dimension or KPI measure ──────────────────────
+        # Dimension: column has only text values in data rows (row labels).
+        # KPI measure: column has numeric or formula values.
+        dimensions: list[str] = []
+        kpi_measures: list[str] = []
+        for ci, col_name in enumerate(col_names):
+            if col_name is None:
+                continue
+            if sample_txt[ci] > 0 and sample_num[ci] == 0:
+                dimensions.append(col_name)
+            else:
+                kpi_measures.append(col_name)
+
+        if not kpi_measures:
+            continue
+
+        blocks.append(KpiBlock(
+            block_name=title or f"Block {len(blocks) + 1}",
+            dimensions=dimensions,
+            kpi_measures=kpi_measures,
+            header_row=h_idx + 1,
+            data_start_row=data_start + 1,
+            data_end_row=data_end + 1,
+        ))
+
+    # Only surface blocks when there are multiple, or a single named block.
+    # A single "Block 1" (no real title found) is just a normal table.
+    named = [b for b in blocks if not b.block_name.startswith("Block ")]
+    if len(blocks) >= 2 or named:
+        return blocks
+    return []
 
 
 def _parse_formula_refs(
