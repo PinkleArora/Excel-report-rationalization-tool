@@ -73,7 +73,7 @@ def _reset_state() -> None:
         _SS_STEP, _SS_BUNDLES, _SS_CONFIG, _SS_DISCOVERY, _SS_CONSOLIDATION,
         _SS_SELECTED_GROUP, _SS_SCHEMA, _SS_KPI, _SS_VALIDATION, _SS_GENERATION,
         _SS_SOURCE_TAB_OVERRIDES, _SS_GROUP_OVERRIDES, _SS_KPI_ALIGN_DECISIONS,
-        _OVERRIDES_KEY, _ACTION_KEY, "ar_kpi_tab_overrides",
+        _OVERRIDES_KEY, _ACTION_KEY, "ar_kpi_tab_overrides", "ar_detection_type_overrides",
     ]:
         st.session_state.pop(key, None)
 
@@ -436,7 +436,16 @@ def _render_step_2() -> None:
             kpi_conf_icon = _conf_color(kpi_conf_avg) if kpi_conf_avg > 0 else "⚪"
             low_conf_kpi  = kpi_conf_avg > 0 and kpi_conf_avg < 0.85
 
-            r1c1, r1c2, r1c3 = st.columns([2, 2, 1])
+            # Detect current detection type from previous KPI run if available
+            kpi_result_obj_step2: AgentResult | None = st.session_state.get(_SS_KPI)
+            kpi_analysis_step2 = kpi_result_obj_step2.output if kpi_result_obj_step2 else None
+            dt_map_step2 = getattr(kpi_analysis_step2, "detection_types", {}) if kpi_analysis_step2 else {}
+            dt_overrides = st.session_state.get("ar_detection_type_overrides", {})
+            current_detection_type = dt_overrides.get(fname) or dt_map_step2.get(fname, "Formula-Based")
+            _DT_OPTIONS = ["Formula-Based", "Pivot-Based", "Mixed"]
+            _DT_ICONS   = {"Formula-Based": "🧮", "Pivot-Based": "🔄", "Mixed": "⚡"}
+
+            r1c1, r1c2, r1c3, r1c4 = st.columns([2, 2, 1, 1])
             with r1c1:
                 st.markdown(f"**Source Tab:** `{source_tab}` {src_conf_icon} {src_conf_pct}")
                 if low_conf_src:
@@ -445,21 +454,24 @@ def _render_step_2() -> None:
                 kpi_str = ", ".join(f"`{t}`" for t in kpi_tabs) if kpi_tabs else "*(none detected)*"
                 st.markdown(f"**KPI Tab(s):** {kpi_str} {kpi_conf_icon}")
                 if not kpi_tabs:
-                    st.caption("⚠️ No KPI tabs found — formulas may be pivot-based")
+                    st.caption("⚠️ No KPI tabs found — may be pivot-based")
                 elif low_conf_kpi:
                     st.caption("⚠️ Low confidence KPI tab identification")
             with r1c3:
+                dt_icon = _DT_ICONS.get(current_detection_type, "🧮")
+                st.markdown(f"**Detection:** {dt_icon} `{current_detection_type}`")
+            with r1c4:
                 if row_count:
                     st.caption(f"**{row_count:,}** rows")
                     st.caption(f"Grain: {grain_label}")
 
-            # Source/KPI tab override
+            # Source/KPI tab + Detection Type override
             if all_sheets:
                 with st.expander(
                     f"Override source/KPI tab for `{fname}`",
                     expanded=low_conf_src or low_conf_kpi or not kpi_tabs,
                 ):
-                    ov_c1, ov_c2 = st.columns(2)
+                    ov_c1, ov_c2, ov_c3 = st.columns(3)
                     with ov_c1:
                         default_idx = all_sheets.index(source_tab) if source_tab in all_sheets else 0
                         new_tab = st.selectbox(
@@ -486,6 +498,19 @@ def _render_step_2() -> None:
                             kpi_overrides = st.session_state.get("ar_kpi_tab_overrides", {})
                             kpi_overrides[fname] = new_kpi_tabs
                             st.session_state["ar_kpi_tab_overrides"] = kpi_overrides
+                            changed = True
+                    with ov_c3:
+                        dt_default_idx = _DT_OPTIONS.index(current_detection_type) if current_detection_type in _DT_OPTIONS else 0
+                        new_dt = st.selectbox(
+                            "Detection type:",
+                            _DT_OPTIONS,
+                            index=dt_default_idx,
+                            key=f"ar_det_type_{fname}",
+                            help="Formula-Based: SUMIFS/COUNTIFS/etc. | Pivot-Based: pivot tables | Mixed: both",
+                        )
+                        if new_dt != current_detection_type:
+                            dt_overrides[fname] = new_dt
+                            st.session_state["ar_detection_type_overrides"] = dt_overrides
                             changed = True
 
     if changed:
@@ -796,17 +821,20 @@ def _render_step_3() -> None:
         else:
             for wks in wb_kpi_stats:
                 conf_icon = _conf_color(wks.detection_confidence)
+                dt = getattr(wks, "detection_type", "Formula-Based")
+                dt_icon = {"Formula-Based": "🧮", "Pivot-Based": "🔄", "Mixed": "⚡"}.get(dt, "🧮")
                 with st.expander(
                     f"{conf_icon} **{wks.workbook_name}** — "
                     f"{wks.kpi_column_count} KPI column(s), "
-                    f"{wks.formula_count} formula(s)",
+                    f"{wks.formula_count} formula(s)  {dt_icon} {dt}",
                     expanded=True,
                 ):
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("KPI Tabs Found", len(wks.kpi_tabs))
                     c2.metric("KPI Formulas", wks.formula_count)
                     c3.metric("KPI Columns", wks.kpi_column_count)
                     c4.metric("Detection Confidence", f"{wks.detection_confidence:.0%}")
+                    c5.metric("Detection Type", dt)
                     if wks.kpi_tabs:
                         st.markdown(
                             "**KPI Tabs Identified:** " +

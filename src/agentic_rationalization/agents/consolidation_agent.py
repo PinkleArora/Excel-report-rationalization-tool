@@ -159,6 +159,7 @@ class WorkbookKpiStats:
     kpi_column_count: int    # count of canonical KPI columns this workbook contributes
     detection_confidence: float
     reason_if_empty: str     # e.g. "No formulas found" if kpi_column_count == 0
+    detection_type: str = "Formula-Based"  # "Formula-Based" | "Pivot-Based" | "Mixed"
 
 
 @dataclass
@@ -516,13 +517,26 @@ def _compute_workbook_kpi_stats(
             confidence = 0.0
             reason = "No KPI tabs configured for this workbook."
 
+        # Pull detection_type from KpiAnalysisResult if available
+        detection_type = "Formula-Based"
+        if kpi_result is not None:
+            dt_map = getattr(kpi_result, "detection_types", {})
+            detection_type = dt_map.get(fname, "Formula-Based")
+
+        # Also discover pivot-based KPI tabs not in wb_cfg.kpi_tabs
+        pivot_kpi_tabs = list({
+            d.kpi_tab for d in file_deps if d.kpi_type == "PIVOT"
+        })
+        all_kpi_tabs = list(dict.fromkeys(kpi_tabs + pivot_kpi_tabs))
+
         stats.append(WorkbookKpiStats(
             workbook_name=fname,
-            kpi_tabs=kpi_tabs,
+            kpi_tabs=all_kpi_tabs,
             formula_count=formula_count,
             kpi_column_count=kpi_col_count,
             detection_confidence=confidence,
             reason_if_empty=reason,
+            detection_type=detection_type,
         ))
     return stats
 

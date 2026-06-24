@@ -122,6 +122,8 @@ class KpiAnalysisResult:
     unreferenced_canonicals: set[str]
     # Data lineage paths
     lineage: list[KpiLineage] = field(default_factory=list)
+    # Per-workbook detection type: "Formula-Based" | "Pivot-Based" | "Mixed"
+    detection_types: dict[str, str] = field(default_factory=dict)
 
     def to_dependency_dataframe(self) -> pd.DataFrame:
         rows = []
@@ -405,6 +407,80 @@ def analyze_kpi_dependencies(
                     bundle.file_name, kpi_tab,
                 )
 
+    # ── Pivot-table scan ──────────────────────────────────────────────────────
+    # Scan every sheet of every workbook for pivot tables that reference the
+    # configured source tab.  Classify those sheets as KPI tabs (Pivot-Based)
+    # and emit KpiDependency records for each pivot value field.
+    formula_wb_tabs: set[tuple[str, str]] = {
+        (d.workbook_name, d.kpi_tab) for d in dependencies
+    }
+    pivot_deps: list[KpiDependency] = []
+
+    for bundle in bundles:
+        wb_cfg = config.config_for(bundle.file_name)
+        if wb_cfg is None:
+            continue
+        raw_wb = getattr(bundle, "_raw_wb", None)
+        source_tab = wb_cfg.source_tab
+        source_df = bundle.sheets.get(source_tab)
+        source_headers = list(source_df.columns) if source_df is not None else []
+
+        for sheet_name in bundle.sheets:
+            raw_ws = _get_raw_ws(raw_wb, sheet_name)
+            if raw_ws is None:
+                continue
+            pivots = getattr(raw_ws, "_pivots", [])
+            if not pivots:
+                continue
+            # Check if any pivot references the source tab
+            references_source = False
+            for pv in pivots:
+                cache = getattr(pv, "cache", None)
+                ws_source = getattr(cache, "worksheetSource", None)
+                if ws_source is not None:
+                    ref_sheet = getattr(ws_source, "sheet", "") or ""
+                    if ref_sheet == source_tab:
+                        references_source = True
+                        break
+                # Fallback: pivot cache name contains source tab name
+                cache_name = getattr(cache, "refreshedBy", "") or getattr(cache, "id", "")
+                if source_tab.lower() in str(cache_name).lower():
+                    references_source = True
+                    break
+            if not references_source:
+                # Still try extraction — if it yields business measures, include them
+                piv = _extract_pivot_kpis(raw_wb, sheet_name, source_tab, source_headers, bundle.file_name)
+                if piv:
+                    pivot_deps.extend(piv)
+            else:
+                piv = _extract_pivot_kpis(raw_wb, sheet_name, source_tab, source_headers, bundle.file_name)
+                pivot_deps.extend(piv)
+
+            if pivot_deps and sheet_name not in wb_cfg.kpi_tabs:
+                logger.info(
+                    "Pivot-based KPI sheet '%s/%s' detected — %d measure(s)",
+                    bundle.file_name, sheet_name, len([p for p in pivot_deps if p.workbook_name == bundle.file_name and p.kpi_tab == sheet_name]),
+                )
+
+    dependencies.extend(pivot_deps)
+
+    # ── Detection type per workbook ───────────────────────────────────────────
+    detection_types: dict[str, str] = {}
+    all_wb_names = {d.workbook_name for d in dependencies}
+    for wb in all_wb_names:
+        wb_deps = [d for d in dependencies if d.workbook_name == wb]
+        has_formula = any(d.kpi_type == "FORMULA" for d in wb_deps)
+        has_gpd     = any(d.kpi_type == "GETPIVOTDATA" for d in wb_deps)
+        has_pivot   = any(d.kpi_type == "PIVOT" for d in wb_deps)
+        if (has_formula or has_gpd) and has_pivot:
+            detection_types[wb] = "Mixed"
+        elif has_pivot:
+            detection_types[wb] = "Pivot-Based"
+        elif has_formula or has_gpd:
+            detection_types[wb] = "Formula-Based"
+        else:
+            detection_types[wb] = "Formula-Based"
+
     referenced: set[str] = {
         canonical
         for dep in dependencies
@@ -421,11 +497,12 @@ def analyze_kpi_dependencies(
     n_derived = sum(1 for d in dependencies if d.formula_type == "DERIVED")
     n_rollup  = sum(1 for d in dependencies if d.formula_type == "ROLLUP")
     n_valid   = sum(1 for d in dependencies if d.formula_type == "VALIDATION")
+    n_pivot   = sum(1 for d in dependencies if d.kpi_type == "PIVOT")
 
     logger.info(
-        "KPI analysis: %d formula(s) [%d source-backed, %d derived, %d rollup, %d validation], "
+        "KPI analysis: %d formula(s) [%d source-backed, %d derived, %d rollup, %d validation, %d pivot], "
         "%d source canonical(s) referenced, %d unreferenced",
-        len(dependencies), n_source, n_derived, n_rollup, n_valid,
+        len(dependencies), n_source, n_derived, n_rollup, n_valid, n_pivot,
         len(referenced), len(unreferenced),
     )
 
@@ -459,7 +536,108 @@ def analyze_kpi_dependencies(
         referenced_canonicals=referenced,
         unreferenced_canonicals=unreferenced,
         lineage=lineage,
+        detection_types=detection_types,
     )
+
+
+# ── Pivot table KPI extractor ─────────────────────────────────────────────────
+
+_BUSINESS_MEASURES = frozenset({
+    "reserve", "reserves", "count", "counts", "balance", "balances",
+    "premium", "premiums", "claim", "claims", "amount", "amounts",
+    "total", "sum", "net", "gross", "earned", "incurred", "paid",
+    "outstanding", "ibnr", "ulr", "loss", "expense", "exposure",
+    "policy", "policies", "rate", "fee", "revenue", "cost",
+})
+
+
+def _is_business_measure(field_name: str) -> bool:
+    """True when a pivot value field name looks like a business metric."""
+    words = set(re.split(r"[\s_\-]+", field_name.lower()))
+    return bool(words & _BUSINESS_MEASURES)
+
+
+def _extract_pivot_kpis(
+    raw_wb,
+    sheet_name: str,
+    source_tab: str,
+    source_headers: list[str],
+    workbook_name: str,
+) -> list[KpiDependency]:
+    """Extract KPI dependencies from pivot tables on *sheet_name*.
+
+    Openpyxl exposes pivot cache definitions via ``worksheet._pivots``.  Each
+    pivot has:
+    - ``cache.cacheFields`` — all source fields (column names)
+    - ``dataFields`` — value fields (the aggregated business measures)
+
+    We emit one KpiDependency per data field whose name matches a source column
+    or looks like a business measure.
+    """
+    raw_ws = _get_raw_ws(raw_wb, sheet_name)
+    if raw_ws is None:
+        return []
+
+    pivots = getattr(raw_ws, "_pivots", [])
+    if not pivots:
+        return []
+
+    normed_source = {normalize_column_name(h): h for h in source_headers}
+    deps: list[KpiDependency] = []
+
+    for pivot in pivots:
+        cache = getattr(pivot, "cache", None)
+        if cache is None:
+            continue
+
+        # All field names in the pivot cache (mirrors source tab columns)
+        cache_fields = [
+            getattr(f, "name", None) for f in getattr(cache, "cacheFields", [])
+        ]
+        cache_fields = [f for f in cache_fields if f]
+
+        # Value fields only (data fields = the measures, not row/col fields)
+        data_fields = getattr(pivot, "dataFields", None)
+        if data_fields is None:
+            # Fallback: treat all fields that look like business measures
+            value_field_names = [
+                f for f in cache_fields if _is_business_measure(f)
+            ]
+        else:
+            value_field_names = []
+            for df in getattr(data_fields, "dataField", []):
+                # df.field is the 0-based index into cache_fields
+                idx = getattr(df, "field", None)
+                name = getattr(df, "name", None) or (cache_fields[idx] if idx is not None and idx < len(cache_fields) else None)
+                if name:
+                    value_field_names.append(name)
+            if not value_field_names:
+                value_field_names = [f for f in cache_fields if _is_business_measure(f)]
+
+        for field_name in value_field_names:
+            canonical = normalize_column_name(field_name)
+            # Match to a source column if possible
+            matched_source = normed_source.get(canonical, "")
+            canonical_cols = [canonical] if (canonical in normed_source or _is_business_measure(field_name)) else []
+            if not canonical_cols:
+                continue
+
+            deps.append(KpiDependency(
+                workbook_name=workbook_name,
+                kpi_tab=sheet_name,
+                cell_address="PIVOT",
+                kpi_label=field_name,
+                formula=f"PIVOT({source_tab}[{field_name}])",
+                aggregate_function="SUM",
+                raw_refs=[(source_tab, "")],
+                canonical_source_columns=canonical_cols,
+                refs_source_tab_only=True,
+                formula_type="SOURCE_BACKED",
+                kpi_type="PIVOT",
+                pivot_tab=sheet_name,
+            ))
+
+    return deps
 
 
 # ── Formula parser ────────────────────────────────────────────────────────────
