@@ -175,6 +175,9 @@ class TabAnalysis:
     is_pivot_sheet: bool = False             # True when this sheet has pivot tables
     pivot_source_tabs: list[str] = field(default_factory=list)   # sheets feeding this pivot
     pivot_value_fields: list[str] = field(default_factory=list)  # measure/KPI field names
+    pivot_row_fields: list[str] = field(default_factory=list)    # row dimension fields
+    pivot_col_fields: list[str] = field(default_factory=list)    # column dimension fields
+    pivot_filter_fields: list[str] = field(default_factory=list) # page/filter dimension fields
     # Multi-block KPI structure — populated for KPI_SUMMARY / DASHBOARD / OUTPUT tabs
     kpi_blocks: list[KpiBlock] = field(default_factory=list)
 
@@ -292,6 +295,7 @@ class _PivotInfo:
     source_sheets: list[str]
     value_fields: list[str]
     row_fields: list[str]
+    col_fields: list[str]
     filter_fields: list[str]
 
 
@@ -358,6 +362,7 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
         source_sheets: list[str] = []
         value_fields: list[str] = []
         row_fields_raw: list[str] = []
+        col_fields_raw: list[str] = []
         filter_fields_raw: list[str] = []
         all_cache_fields: list[str] = []   # accumulated across all pivots on this sheet
 
@@ -424,6 +429,16 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
                         if name and name not in row_fields_raw:
                             row_fields_raw.append(name)
 
+            # Column fields
+            col_fields_obj = getattr(pv, "colFields", None)
+            if col_fields_obj is not None:
+                for cf in getattr(col_fields_obj, "field", []):
+                    idx = getattr(cf, "x", None)
+                    if idx is not None and 0 <= idx < len(cache_fields):
+                        name = cache_fields[idx]
+                        if name and name not in col_fields_raw:
+                            col_fields_raw.append(name)
+
             # Filter fields
             pf_obj = getattr(pv, "pageFields", None)
             if pf_obj is not None:
@@ -456,6 +471,7 @@ def _scan_pivots(raw_wb: Any) -> list[_PivotInfo]:
             source_sheets=source_sheets,
             value_fields=value_fields,
             row_fields=row_fields_raw,
+            col_fields=col_fields_raw,
             filter_fields=filter_fields_raw,
         ))
 
@@ -519,6 +535,9 @@ def analyze_workbook(
             tab.is_pivot_sheet = True
             tab.pivot_source_tabs = pinfo.source_sheets
             tab.pivot_value_fields = pinfo.value_fields
+            tab.pivot_row_fields = pinfo.row_fields
+            tab.pivot_col_fields = pinfo.col_fields
+            tab.pivot_filter_fields = pinfo.filter_fields
             n_kpi = len(pinfo.value_fields)
             src_str = ", ".join(pinfo.source_sheets) if pinfo.source_sheets else "unknown"
             tab.classification_reason = (
@@ -1080,6 +1099,88 @@ def _detect_aggregate_function(formula: str) -> str:
 
 _KPI_BLOCK_MAX_BLANK_GAP = 3  # consecutive blank rows that terminate a block
 
+# Column-name prefixes that unambiguously identify an aggregated KPI measure.
+# Matches case-insensitively.
+_AGGREGATE_NAME_PREFIXES = (
+    "sum of ", "count of ", "avg of ", "average of ",
+    "min of ", "max of ", "total of ", "% of ", "pct of ",
+    "stdev of ", "var of ", "median of ",
+)
+
+
+def _col_is_aggregate_by_name(col_name: str) -> bool:
+    """Return True when the column name starts with a known aggregate prefix."""
+    low = col_name.lower()
+    return any(low.startswith(p) for p in _AGGREGATE_NAME_PREFIXES)
+
+
+def _classify_block_columns(
+    col_names: list[str | None],
+    sample_txt: list[int],
+    sample_num: list[int],
+) -> tuple[list[str], list[str]]:
+    """Classify columns as dimensions or KPI measures.
+
+    Rules (applied in order):
+    1. Column name starts with an aggregate prefix → KPI measure.
+    2. All text, no numeric samples → dimension (row label).
+    3. Positional: find the index of the first KPI measure (from rules 1 or 3b).
+       Columns before that index are dimensions even if numeric (grouping codes).
+       Columns at or after are KPI measures unless they are pure-text.
+    4. Any numeric column after the first KPI measure → KPI measure.
+    """
+    n = len(col_names)
+    # Step 1 & 2: initial per-column classification
+    is_agg = [False] * n
+    is_text_only = [False] * n
+    for ci, col_name in enumerate(col_names):
+        if col_name is None:
+            continue
+        if _col_is_aggregate_by_name(col_name):
+            is_agg[ci] = True
+        elif sample_txt[ci] > 0 and sample_num[ci] == 0:
+            is_text_only[ci] = True
+
+    # Step 3: find the first aggregate-named or first clearly-numeric non-text column
+    # to anchor the dimension/measure boundary.
+    first_measure_idx: int | None = None
+    for ci, col_name in enumerate(col_names):
+        if col_name is None:
+            continue
+        if is_agg[ci]:
+            first_measure_idx = ci
+            break
+
+    # If no aggregate-name found, fall back to the first purely-numeric column
+    # that isn't text-only (legacy heuristic for unlabelled pivots).
+    if first_measure_idx is None:
+        for ci, col_name in enumerate(col_names):
+            if col_name is None:
+                continue
+            if not is_text_only[ci] and sample_num[ci] > 0:
+                first_measure_idx = ci
+                break
+
+    dimensions: list[str] = []
+    kpi_measures: list[str] = []
+    for ci, col_name in enumerate(col_names):
+        if col_name is None:
+            continue
+        if is_text_only[ci]:
+            # Pure text → always a dimension
+            dimensions.append(col_name)
+        elif is_agg[ci]:
+            kpi_measures.append(col_name)
+        elif first_measure_idx is not None and ci < first_measure_idx:
+            # Appears before the first known aggregate → grouping dimension
+            # (handles numeric codes like Ledger Product, Plancode, etc.)
+            dimensions.append(col_name)
+        else:
+            # Numeric column at or after the first measure boundary → KPI
+            kpi_measures.append(col_name)
+
+    return dimensions, kpi_measures
+
 
 def scan_kpi_blocks(raw_ws: Any, max_rows: int = 2_000) -> list[KpiBlock]:
     """Detect multi-section (block) structure in a KPI/summary worksheet.
@@ -1235,17 +1336,9 @@ def scan_kpi_blocks(raw_ws: Any, max_rows: int = 2_000) -> list[KpiBlock]:
             continue
 
         # ── Classify columns as dimension or KPI measure ──────────────────────
-        # Dimension: column has only text values in data rows (row labels).
-        # KPI measure: column has numeric or formula values.
-        dimensions: list[str] = []
-        kpi_measures: list[str] = []
-        for ci, col_name in enumerate(col_names):
-            if col_name is None:
-                continue
-            if sample_txt[ci] > 0 and sample_num[ci] == 0:
-                dimensions.append(col_name)
-            else:
-                kpi_measures.append(col_name)
+        dimensions, kpi_measures = _classify_block_columns(
+            col_names, sample_txt, sample_num
+        )
 
         if not kpi_measures:
             continue

@@ -578,9 +578,47 @@ def _render_step_2() -> None:
                 blocks_cache: dict = st.session_state.setdefault(_SS_BLOCKS_CACHE, {})
                 cache_key = (selected_wb, explorer_sheet)
                 if cache_key not in blocks_cache:
-                    raw_wb = getattr(bundle, "_raw_wb", None)
-                    raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
-                    blocks_cache[cache_key] = scan_kpi_blocks(raw_ws) if raw_ws is not None else []
+                    # Prefer pivot metadata when available — it gives authoritative
+                    # Row/Col/Filter = dimensions, Data = KPI measures classification.
+                    wb_analyses = st.session_state.get(_SS_WB_ANALYSES) or []
+                    tab_analysis = next(
+                        (
+                            t
+                            for a in wb_analyses
+                            if a.workbook_name == selected_wb
+                            for t in a.tab_analyses
+                            if t.tab_name == explorer_sheet
+                        ),
+                        None,
+                    )
+                    if tab_analysis is not None and tab_analysis.is_pivot_sheet and tab_analysis.pivot_value_fields:
+                        from src.ingestion.workbook_analyzer import KpiBlock
+                        all_dim_fields = (
+                            tab_analysis.pivot_filter_fields
+                            + tab_analysis.pivot_row_fields
+                            + tab_analysis.pivot_col_fields
+                        )
+                        # Deduplicate while preserving order
+                        seen: set[str] = set()
+                        dims: list[str] = []
+                        for f in all_dim_fields:
+                            if f not in seen:
+                                seen.add(f)
+                                dims.append(f)
+                        blocks_cache[cache_key] = [
+                            KpiBlock(
+                                block_name=explorer_sheet,
+                                dimensions=dims,
+                                kpi_measures=tab_analysis.pivot_value_fields,
+                                header_row=1,
+                                data_start_row=2,
+                                data_end_row=len(df_exp) + 1,
+                            )
+                        ]
+                    else:
+                        raw_wb = getattr(bundle, "_raw_wb", None)
+                        raw_ws = _get_raw_ws(raw_wb, explorer_sheet)
+                        blocks_cache[cache_key] = scan_kpi_blocks(raw_ws) if raw_ws is not None else []
                 kpi_blocks = blocks_cache[cache_key]
 
             struct_label = _tab_structure_label(bundle, explorer_sheet, discovery_result)
